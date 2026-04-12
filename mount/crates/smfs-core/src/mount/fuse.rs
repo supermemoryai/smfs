@@ -32,5 +32,24 @@
 //! - `unmount_fuse(path, lazy)` — tries `fusermount3 -u` first, falls
 //!   back to `fusermount -u`, adds `-z` for lazy
 
+use std::sync::Arc;
+
+use crate::vfs::FileSystem;
+
+use super::{MountHandle, MountOpts};
+
+/// Mount a filesystem using the FUSE backend (Linux only).
+///
+/// Stub for M3b — the real implementation lands in M3f (adapter wiring +
+/// `fuser::spawn_mount2` invocation). Currently always returns "not implemented".
+#[allow(clippy::needless_pass_by_value)] // signature matches the eventual real one
+pub async fn mount_fuse<F>(fs: Arc<F>, opts: MountOpts) -> anyhow::Result<MountHandle>
+where
+    F: FileSystem + 'static,
+{
+    let _ = (fs, opts);
+    anyhow::bail!("FUSE mount not implemented yet — lands in M3f")
+}
+
 // TODO(M3e): FuseAdapter struct + fuser::Filesystem implementation
 // TODO(M3f): mount_fuse / unmount_fuse helpers

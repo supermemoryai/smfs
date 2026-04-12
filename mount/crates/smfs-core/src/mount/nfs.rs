@@ -32,5 +32,24 @@
 //!   lazy unmount)
 //! - Port discovery starting at 11111
 
+use std::sync::Arc;
+
+use crate::vfs::FileSystem;
+
+use super::{MountHandle, MountOpts};
+
+/// Mount a filesystem using the NFSv3 backend.
+///
+/// Stub for M3b — the real implementation lands in M3d (adapter wiring +
+/// mount command exec). Currently always returns "not implemented".
+#[allow(clippy::needless_pass_by_value)] // signature matches the eventual real one
+pub async fn mount_nfs<F>(fs: Arc<F>, opts: MountOpts) -> anyhow::Result<MountHandle>
+where
+    F: FileSystem + 'static,
+{
+    let _ = (fs, opts);
+    anyhow::bail!("NFS mount not implemented yet — lands in M3d")
+}
+
 // TODO(M3c): NfsAdapter struct + nfsserve::vfs::NFSFileSystem implementation
 // TODO(M3d): mount_nfs / unmount_nfs helpers + port discovery
