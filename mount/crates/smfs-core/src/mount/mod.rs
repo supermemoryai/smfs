@@ -190,19 +190,24 @@ pub struct MountHandle {
 
 /// Backend-specific state kept alive while the mount exists.
 ///
-/// The variants grow as backends land: `Stub` is the placeholder for M3b.
-/// M3d will add `Nfs { shutdown: CancellationToken, task: JoinHandle<()> }`.
-/// M3f will add `Fuse { thread: JoinHandle<anyhow::Result<()>> }`.
+/// The variants grow as backends land: `Stub` is a test-only placeholder.
+/// M3d adds `Nfs { server_handle }`. M3f adds `Fuse { session }`.
 #[derive(Debug)]
 #[non_exhaustive]
 pub(crate) enum MountHandleInner {
-    /// Placeholder variant for M3b — holds no resources.
-    ///
-    /// Currently constructed only by unit tests; the stubbed backend
-    /// functions always bail before reaching construction. That changes
-    /// in M3d/M3f when real backend variants get added alongside this one.
+    /// Test-only placeholder. Constructed by unit tests that need a
+    /// `MountHandle` without an actual mount. Real backends use the
+    /// variants below.
     #[allow(dead_code)]
     Stub,
+
+    /// Live NFSv3 mount. `server_handle` owns the spawned task running
+    /// `nfsserve::tcp::NFSTcpListener::handle_forever()`. Aborted on drop
+    /// because nfsserve 0.11 has no graceful shutdown protocol.
+    #[cfg(unix)]
+    Nfs {
+        server_handle: tokio::task::JoinHandle<()>,
+    },
 }
 
 impl MountHandle {
@@ -215,17 +220,55 @@ impl MountHandle {
     pub fn backend(&self) -> MountBackend {
         self.backend
     }
+
+    /// Construct a `MountHandle` for a newly-created NFS mount.
+    ///
+    /// Private constructor used by [`nfs::mount_nfs`]. Outside callers should
+    /// go through [`mount_fs`].
+    #[cfg(unix)]
+    pub(super) fn new_nfs(
+        mountpoint: PathBuf,
+        lazy_unmount: bool,
+        server_handle: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            mountpoint,
+            backend: MountBackend::Nfs,
+            lazy_unmount,
+            inner: MountHandleInner::Nfs { server_handle },
+        }
+    }
 }
 
 impl Drop for MountHandle {
     fn drop(&mut self) {
-        // M3b: the Stub variant holds nothing, nothing to release.
-        // M3d/M3f will fan this `match` out to real unmount paths.
+        // Move cwd away from the mountpoint so unmount doesn't hit EBUSY.
+        let _ = std::env::set_current_dir("/");
+
         match &mut self.inner {
             MountHandleInner::Stub => {
                 tracing::trace!(
                     mountpoint = %self.mountpoint.display(),
-                    "dropping stub MountHandle (M3b placeholder)"
+                    "dropping stub MountHandle"
+                );
+            }
+            #[cfg(unix)]
+            MountHandleInner::Nfs { server_handle } => {
+                // Best-effort unmount. Drop impls can't return errors, so
+                // we log and continue; the task abort below still runs.
+                if let Err(e) = nfs::unmount_nfs(&self.mountpoint, self.lazy_unmount) {
+                    tracing::error!(
+                        error = %e,
+                        mountpoint = %self.mountpoint.display(),
+                        "failed to unmount NFS"
+                    );
+                }
+                // Always abort the server task, even if unmount failed,
+                // to avoid leaking a tokio task.
+                server_handle.abort();
+                tracing::debug!(
+                    mountpoint = %self.mountpoint.display(),
+                    "NFS mount handle dropped"
                 );
             }
         }
@@ -346,15 +389,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mount_fs_returns_not_implemented_error() {
+    async fn mount_fs_errors_on_missing_mountpoint() {
+        // Post-M3d: mount_fs dispatches to the real mount_nfs, which validates
+        // that the mountpoint exists before attempting anything else. A
+        // nonexistent path should surface as a clean error.
         let fs = Arc::new(MemFs::new());
-        let opts = MountOpts::new(PathBuf::from("/tmp/unused"), MountBackend::Nfs);
+        let opts = MountOpts::new(
+            PathBuf::from("/tmp/smfs-nonexistent-test-path-mfs-mod"),
+            MountBackend::Nfs,
+        );
         let result = mount_fs(fs, opts).await;
-        assert!(result.is_err(), "mount_fs should not succeed in M3b");
-        let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("not implemented"),
-            "expected 'not implemented' in error, got: {msg}"
+            result.is_err(),
+            "mount_fs should fail when mountpoint does not exist"
         );
     }
 

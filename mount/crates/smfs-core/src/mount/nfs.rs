@@ -22,7 +22,9 @@
 //! - **M3d** (next): wire [`mount_nfs`] to an `NFSTcpListener`, port
 //!   discovery, and the platform mount command exec.
 
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use nfsserve::nfs::{
@@ -34,6 +36,13 @@ use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use crate::vfs::{FileAttr, FileSystem, SetAttr, TimeOrNow, Timestamp, VfsError};
 
 use super::{MountHandle, MountOpts};
+
+/// Port to start scanning from when looking for a free local port.
+/// High unprivileged port so we don't need root.
+const DEFAULT_NFS_PORT: u16 = 11111;
+
+/// Maximum number of consecutive ports to try before giving up.
+const MAX_PORT_SCAN: u16 = 100;
 
 // ─── Translation helpers ───────────────────────────────────────────────────
 
@@ -424,19 +433,230 @@ impl<F: FileSystem + 'static> NFSFileSystem for NfsAdapter<F> {
     }
 }
 
-// ─── mount_nfs — still stubbed until M3d ───────────────────────────────────
+// ─── mount_nfs (real) ──────────────────────────────────────────────────────
 
-/// Mount a filesystem using the NFSv3 backend.
+/// Mount a filesystem at the path configured in `opts` using NFSv3 over
+/// localhost.
 ///
-/// Stub for M3b/M3c — the real implementation lands in M3d (adapter wiring
-/// + mount command exec). Currently always returns "not implemented".
-#[allow(clippy::needless_pass_by_value)] // signature matches the eventual real one
+/// Validates the mountpoint, wraps `fs` in an [`NfsAdapter`], binds an
+/// [`nfsserve::tcp::NFSTcpListener`] on a free local port, spawns the
+/// listener as a background task, execs the platform-specific mount
+/// command, and returns a [`MountHandle`] whose `Drop` impl unmounts
+/// cleanly.
 pub async fn mount_nfs<F>(fs: Arc<F>, opts: MountOpts) -> anyhow::Result<MountHandle>
 where
     F: FileSystem + 'static,
 {
-    let _ = (fs, opts);
-    anyhow::bail!("NFS mount not implemented yet — lands in M3d")
+    use anyhow::Context;
+    use nfsserve::tcp::{NFSTcp, NFSTcpListener};
+
+    if !opts.mountpoint.exists() {
+        anyhow::bail!("mountpoint does not exist: {}", opts.mountpoint.display());
+    }
+
+    // macOS's mount_nfs wants an absolute path.
+    let mountpoint = std::fs::canonicalize(&opts.mountpoint).with_context(|| {
+        format!(
+            "failed to canonicalize mountpoint {}",
+            opts.mountpoint.display()
+        )
+    })?;
+
+    // Resolve ownership defaults. If the caller didn't set uid/gid in
+    // MountOpts, fall back to 0 (root). The binary crate (M4) is where
+    // we'll query the calling process's effective uid/gid; this library
+    // crate has `#![forbid(unsafe_code)]` so it can't call libc::geteuid
+    // directly, and we deliberately don't pull in an extra crate just
+    // for a process identity lookup.
+    let default_uid = opts.uid.unwrap_or(0);
+    let default_gid = opts.gid.unwrap_or(0);
+
+    let adapter = NfsAdapter::new(fs, default_uid, default_gid);
+
+    let port = find_free_port(DEFAULT_NFS_PORT)?;
+    let bind_addr = format!("127.0.0.1:{port}");
+
+    let listener = NFSTcpListener::bind(&bind_addr, adapter)
+        .await
+        .with_context(|| format!("failed to bind NFS listener on {bind_addr}"))?;
+
+    // Spawn the accept loop. nfsserve 0.11 has no graceful shutdown, so the
+    // task runs forever until `server_handle.abort()` is called from Drop.
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = listener.handle_forever().await {
+            tracing::error!(error = %e, "NFS server task ended unexpectedly");
+        }
+    });
+
+    // Give the listener a moment to accept connections before the mount
+    // command tries to reach it. Same 100ms value AgentFS uses.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Run the blocking `mount_nfs` subprocess on a dedicated blocking
+    // thread so the tokio runtime stays free to service NFS RPC calls
+    // from the kernel. Without spawn_blocking, a single-threaded runtime
+    // (the default for `#[tokio::test]`) would deadlock: the subprocess
+    // waits for NFS responses, the NFS listener can't run because the
+    // main thread is blocked in subprocess wait.
+    let mountpoint_for_cmd = mountpoint.clone();
+    let mount_result =
+        tokio::task::spawn_blocking(move || nfs_mount_command(port, &mountpoint_for_cmd))
+            .await
+            .map_err(|e| anyhow::anyhow!("mount command task panicked: {e}"))?;
+
+    if let Err(e) = mount_result {
+        // Roll back the spawned task so we don't leak it if the mount
+        // command failed after we bound the listener.
+        server_handle.abort();
+        return Err(e);
+    }
+
+    tracing::info!(
+        mountpoint = %mountpoint.display(),
+        port,
+        "NFS mount ready"
+    );
+
+    Ok(MountHandle::new_nfs(
+        mountpoint,
+        opts.lazy_unmount,
+        server_handle,
+    ))
+}
+
+// ─── Platform-specific mount command exec ──────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn nfs_mount_command(port: u16, mountpoint: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::process::Command;
+
+    let options =
+        format!("locallocks,vers=3,tcp,port={port},mountport={port},soft,timeo=10,retrans=2");
+    let output = Command::new("/sbin/mount_nfs")
+        .arg("-o")
+        .arg(&options)
+        .arg("127.0.0.1:/")
+        .arg(mountpoint)
+        .output()
+        .context("failed to execute /sbin/mount_nfs")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("mount_nfs failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn nfs_mount_command(port: u16, mountpoint: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::process::Command;
+
+    let options = format!("vers=3,tcp,port={port},mountport={port},nolock,soft,timeo=10,retrans=2");
+    let output = Command::new("mount")
+        .arg("-t")
+        .arg("nfs")
+        .arg("-o")
+        .arg(&options)
+        .arg("127.0.0.1:/")
+        .arg(mountpoint)
+        .output()
+        .context("failed to execute mount")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "mount -t nfs failed: {}. Make sure nfs-common (Debian/Ubuntu) or \
+             nfs-utils (Fedora/RHEL) is installed and you have permission to \
+             mount (try running with sudo).",
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+// ─── Platform-specific unmount ─────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+pub(super) fn unmount_nfs(mountpoint: &Path, _lazy: bool) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::process::Command;
+
+    let output = Command::new("/sbin/umount")
+        .arg(mountpoint)
+        .output()
+        .context("failed to execute umount")?;
+
+    if !output.status.success() {
+        // macOS sometimes reports the mount as "resource busy" even when
+        // nothing's using it. Fall back to force unmount.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let forced = Command::new("/sbin/umount")
+            .arg("-f")
+            .arg(mountpoint)
+            .output()?;
+        if !forced.status.success() {
+            anyhow::bail!(
+                "failed to unmount {}: {}",
+                mountpoint.display(),
+                stderr.trim()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn unmount_nfs(mountpoint: &Path, lazy: bool) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::process::Command;
+
+    let mut cmd = Command::new("umount");
+    if lazy {
+        cmd.arg("-l");
+    }
+    cmd.arg(mountpoint);
+
+    let output = cmd.output().context("failed to execute umount")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // If the regular unmount failed, try lazy as a fallback.
+        if !lazy {
+            let forced = Command::new("umount").arg("-l").arg(mountpoint).output()?;
+            if forced.status.success() {
+                return Ok(());
+            }
+        }
+        anyhow::bail!(
+            "failed to unmount {}: {}",
+            mountpoint.display(),
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+// ─── Port discovery ────────────────────────────────────────────────────────
+
+/// Find a free TCP port on localhost, scanning upward from `start`.
+///
+/// Binds a throwaway `std::net::TcpListener` on each candidate port to
+/// probe for availability. There's a tiny race between probe and the
+/// subsequent `NFSTcpListener::bind` call, but in practice nothing else
+/// scans this port range on a dev machine.
+fn find_free_port(start: u16) -> anyhow::Result<u16> {
+    for offset in 0..MAX_PORT_SCAN {
+        let port = start.saturating_add(offset);
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return Ok(port);
+        }
+    }
+    anyhow::bail!(
+        "could not find a free port in range {}-{}",
+        start,
+        start.saturating_add(MAX_PORT_SCAN)
+    )
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
@@ -569,5 +789,170 @@ mod tests {
             .unwrap();
         let result = adap.readlink(ino).await.unwrap();
         assert_eq!(result.0, b"/some/target");
+    }
+
+    // ─── M3d additions: mount_nfs building blocks ──────────────────────
+
+    #[test]
+    fn find_free_port_returns_bindable_port() {
+        // Scan starting from a high port unlikely to be already occupied
+        // on a dev machine. (DEFAULT_NFS_PORT = 11111 may already be in
+        // use by other NFS tooling; avoid depending on a fixed low port.)
+        let port = find_free_port(50_000).expect("should find a free port");
+        let bound = std::net::TcpListener::bind(("127.0.0.1", port));
+        assert!(bound.is_ok(), "returned port {port} was not bindable");
+    }
+
+    #[test]
+    fn find_free_port_skips_occupied_ports() {
+        // Bind to port 0 so the kernel hands us a guaranteed-free
+        // ephemeral port. Keep that listener alive while we call
+        // find_free_port starting at the same port; find_free_port must
+        // skip past it because we're still holding it.
+        let occupied_listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("test setup: could not bind ephemeral port");
+        let occupied_port = occupied_listener.local_addr().unwrap().port();
+
+        let found = find_free_port(occupied_port).expect("should find a free port");
+        assert!(
+            found > occupied_port,
+            "expected find_free_port to skip occupied port {occupied_port}, got {found}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mount_nfs_errors_if_mountpoint_does_not_exist() {
+        use std::path::PathBuf;
+
+        let fs = Arc::new(MemFs::new());
+        let bogus = PathBuf::from("/tmp/smfs-nonexistent-test-path-mnt-nfs");
+        let opts = MountOpts::new(bogus, super::super::MountBackend::Nfs);
+        let result = mount_nfs(fs, opts).await;
+        assert!(
+            result.is_err(),
+            "mount_nfs should fail for missing mountpoint"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("does not exist"),
+            "expected error about missing mountpoint, got: {msg}"
+        );
+    }
+
+    /// End-to-end smoke test — actually mounts a MemFs via NFS on localhost
+    /// and performs real filesystem operations through the kernel.
+    ///
+    /// Marked `#[ignore]` so it doesn't run in normal `cargo test`. Run
+    /// manually with `cargo test smoke_mount_memfs -- --ignored --nocapture`.
+    ///
+    /// This test is the only place in the suite that actually invokes
+    /// `/sbin/mount_nfs`, binds an NFS server on localhost, and round-trips
+    /// operations through the kernel. Everything is wrapped in tokio
+    /// timeouts so it can't hang.
+    ///
+    /// Uses a multi-thread runtime because `MountHandle::drop()` calls
+    /// `std::process::Command::output()` for the umount, which is blocking;
+    /// under a single-threaded runtime the drop would starve the NFS
+    /// listener task during unmount.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "manual smoke test — actually mounts on the host machine"]
+    async fn smoke_mount_memfs_end_to_end() {
+        use std::path::PathBuf;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let mountpoint = PathBuf::from("/tmp/smfs-smoke-test-m3d");
+
+        // Clean up any stale state from a previous failed run.
+        let _ = std::process::Command::new("/sbin/umount")
+            .arg(&mountpoint)
+            .output();
+        let _ = std::fs::remove_dir_all(&mountpoint);
+
+        std::fs::create_dir_all(&mountpoint).expect("create mountpoint directory");
+        println!("→ mountpoint: {}", mountpoint.display());
+
+        let fs = Arc::new(MemFs::new());
+        let opts = MountOpts::new(mountpoint.clone(), super::super::MountBackend::Nfs);
+
+        println!("→ calling mount_nfs (10s timeout)...");
+        let handle = timeout(Duration::from_secs(10), mount_nfs(fs, opts))
+            .await
+            .expect("mount_nfs timed out after 10s")
+            .expect("mount_nfs failed");
+        println!("→ mount succeeded at {}", handle.mountpoint().display());
+
+        // Let the NFS client stabilise before poking at the filesystem.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Op 1: readdir the empty mount.
+        println!("→ op 1: read_dir on fresh mount");
+        let initial: Vec<_> = std::fs::read_dir(&mountpoint)
+            .expect("read_dir on fresh mount")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        println!("    entries: {:?}", initial);
+
+        // Op 2: write a file.
+        println!("→ op 2: write hello.txt");
+        let test_file = mountpoint.join("hello.txt");
+        std::fs::write(&test_file, b"hello from m3d").expect("write hello.txt");
+
+        // Op 3: read it back.
+        println!("→ op 3: read hello.txt back");
+        let content = std::fs::read_to_string(&test_file).expect("read hello.txt");
+        assert_eq!(content, "hello from m3d", "round-trip content mismatch");
+        println!("    content: {:?}", content);
+
+        // Op 4: mkdir.
+        println!("→ op 4: create subdir");
+        let subdir = mountpoint.join("subdir");
+        std::fs::create_dir(&subdir).expect("mkdir subdir");
+
+        // Op 5: verify read_dir now shows both.
+        println!("→ op 5: read_dir after writes");
+        let entries: Vec<_> = std::fs::read_dir(&mountpoint)
+            .expect("read_dir after writes")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        println!("    entries: {:?}", entries);
+        assert!(
+            entries.iter().any(|n| n == "hello.txt"),
+            "hello.txt missing from readdir: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|n| n == "subdir"),
+            "subdir missing from readdir: {entries:?}"
+        );
+
+        // Op 6: unlink the file.
+        println!("→ op 6: remove hello.txt");
+        std::fs::remove_file(&test_file).expect("unlink hello.txt");
+
+        // Op 7: rmdir the subdir.
+        println!("→ op 7: remove subdir");
+        std::fs::remove_dir(&subdir).expect("rmdir subdir");
+
+        // Op 8: final readdir should be empty again.
+        println!("→ op 8: read_dir after cleanup");
+        let final_entries: Vec<_> = std::fs::read_dir(&mountpoint)
+            .expect("read_dir after cleanup")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        println!("    entries: {:?}", final_entries);
+
+        println!("→ all operations succeeded, dropping handle to unmount...");
+        drop(handle);
+
+        // Give the unmount a moment to propagate through the kernel.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Best-effort cleanup: remove the now-unmounted directory.
+        let _ = std::fs::remove_dir_all(&mountpoint);
+
+        println!("→ smoke test complete ✓");
     }
 }
