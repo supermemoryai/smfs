@@ -19,7 +19,7 @@ const INITIAL_BACKOFF_MS: u64 = 100;
 pub struct ApiClient {
     http: Client,
     base_url: String,
-    token: String,
+    api_key: String,
     container_tag: String,
 }
 
@@ -33,7 +33,7 @@ impl std::fmt::Debug for ApiClient {
 }
 
 impl ApiClient {
-    pub fn new(base_url: &str, token: &str, container_tag: &str) -> Self {
+    pub fn new(base_url: &str, api_key: &str, container_tag: &str) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -42,7 +42,7 @@ impl ApiClient {
         Self {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
-            token: token.to_string(),
+            api_key: api_key.to_string(),
             container_tag: container_tag.to_string(),
         }
     }
@@ -171,7 +171,7 @@ impl ApiClient {
     }
 
     fn authed(&self, req: RequestBuilder) -> RequestBuilder {
-        req.header("Authorization", format!("Bearer {}", self.token))
+        req.header("Authorization", format!("Bearer {}", self.api_key))
     }
 }
 
