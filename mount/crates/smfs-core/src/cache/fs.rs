@@ -824,6 +824,13 @@ impl FileSystem for SupermemoryFs {
 
     async fn unlink(&self, parent_ino: u64, name: &str) -> VfsResult<()> {
         validate_name(name)?;
+
+        // Resolve filepath BEFORE deleting dentry (needed for API sync).
+        let filepath_for_api = self.resolve_filepath(parent_ino).map(|p| {
+            let sep = if p.ends_with('/') { "" } else { "/" };
+            format!("{p}{sep}{name}")
+        });
+
         let conn = self.db.conn.lock();
 
         // Look up child.
@@ -889,10 +896,24 @@ impl FileSystem for SupermemoryFs {
         }
 
         tx.commit().map_err(sql_err)?;
+        drop(conn);
 
         self.dentry_cache
             .lock()
             .pop(&(parent_ino, name.to_string()));
+
+        // Push delete to API (fire-and-forget).
+        if let Some(ref api) = self.api {
+            if let Some(fp) = filepath_for_api {
+                let api = api.clone();
+                tokio::spawn(async move {
+                    match api.delete_documents(&fp).await {
+                        Ok(r) => tracing::debug!(filepath = %fp, deleted = r.deleted_count, "deleted from API"),
+                        Err(e) => tracing::warn!(filepath = %fp, error = %e, "failed to delete from API"),
+                    }
+                });
+            }
+        }
 
         Ok(())
     }
@@ -1089,6 +1110,15 @@ impl FileSystem for SupermemoryFs {
     ) -> VfsResult<()> {
         validate_name(old_name)?;
         validate_name(new_name)?;
+
+        // Resolve old filepath BEFORE rename (needed for API sync).
+        let old_filepath = self.resolve_filepath(old_parent_ino).map(|p| {
+            let sep = if p.ends_with('/') { "" } else { "/" };
+            format!("{p}{sep}{old_name}")
+        });
+
+        // All DB work in a block so conn/tx are dropped before any .await.
+        let src_ino = {
         let conn = self.db.conn.lock();
 
         // Find source.
@@ -1211,10 +1241,42 @@ impl FileSystem for SupermemoryFs {
 
         tx.commit().map_err(sql_err)?;
 
-        let mut cache = self.dentry_cache.lock();
-        cache.pop(&(old_parent_ino, old_name.to_string()));
-        cache.pop(&(new_parent_ino, new_name.to_string()));
-        cache.put((new_parent_ino, new_name.to_string()), src_ino as u64);
+        src_ino
+        }; // conn + tx dropped here
+
+        {
+            let mut cache = self.dentry_cache.lock();
+            cache.pop(&(old_parent_ino, old_name.to_string()));
+            cache.pop(&(new_parent_ino, new_name.to_string()));
+            cache.put((new_parent_ino, new_name.to_string()), src_ino as u64);
+        }
+
+        // Resolve new filepath after rename.
+        let new_filepath = self.resolve_filepath(new_parent_ino).map(|p| {
+            let sep = if p.ends_with('/') { "" } else { "/" };
+            format!("{p}{sep}{new_name}")
+        });
+
+        // Push rename to API.
+        if let Some(ref api) = self.api {
+            if let (Some(old_fp), Some(new_fp)) = (old_filepath, new_filepath) {
+                match api.list_documents(Some(&old_fp)).await {
+                    Ok(docs) => {
+                        for doc in docs {
+                            let req = crate::api::UpdateDocumentReq {
+                                filepath: Some(new_fp.clone()),
+                                content: None,
+                            };
+                            match api.update_document(&doc.id, &req).await {
+                                Ok(_) => tracing::debug!(old = %old_fp, new = %new_fp, "renamed in API"),
+                                Err(e) => tracing::warn!(old = %old_fp, error = %e, "API rename failed"),
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(old = %old_fp, error = %e, "API list for rename failed"),
+                }
+            }
+        }
 
         Ok(())
     }
