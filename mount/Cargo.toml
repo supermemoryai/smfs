@@ -36,6 +36,9 @@ serde_json = "1"
 parking_lot = "0.12"
 libc = "0.2"
 
+# HTTP client (M6)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 # SQLite cache (M5)
 rusqlite = { version = "0.32", features = ["bundled"] }
 directories = "5"

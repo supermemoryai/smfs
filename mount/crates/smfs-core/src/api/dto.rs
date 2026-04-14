@@ -1,0 +1,89 @@
+use serde::{Deserialize, Serialize};
+
+/// A document returned by the Supermemory API.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Document {
+    pub id: String,
+    pub filepath: Option<String>,
+    pub custom_id: Option<String>,
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub content: Option<String>,
+    pub status: String,
+    pub container_tags: Option<Vec<String>>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// POST /v3/documents
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateDocumentReq {
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filepath: Option<String>,
+    pub container_tag: String,
+}
+
+/// Response from POST /v3/documents
+#[derive(Debug, Deserialize)]
+pub struct CreateDocumentResp {
+    pub id: String,
+    pub status: String,
+}
+
+/// PATCH /v3/documents/:id
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDocumentReq {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filepath: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+/// POST /v3/documents/list
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDocumentsReq {
+    pub container_tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filepath: Option<String>,
+    pub limit: u32,
+    pub page: u32,
+}
+
+/// Response from POST /v3/documents/list
+#[derive(Debug, Deserialize)]
+pub struct ListDocumentsResp {
+    pub memories: Vec<Document>,
+    pub pagination: Pagination,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Pagination {
+    pub current_page: u32,
+    pub limit: u32,
+    pub total_items: u32,
+    pub total_pages: u32,
+}
+
+/// DELETE /v3/documents/bulk
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkDeleteReq {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filepath: Option<String>,
+}
+
+/// Response from DELETE /v3/documents/bulk
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkDeleteResp {
+    pub success: bool,
+    pub deleted_count: u32,
+}

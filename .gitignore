@@ -14,6 +14,9 @@ bash/.turbo/
 *.log
 dev-mnt/
 
+# Live integration tests (require running API + credentials)
+**/tests/*_live.rs
+
 # Editors
 .vscode/
 .idea/

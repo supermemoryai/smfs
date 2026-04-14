@@ -23,6 +23,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
 libc = { workspace = true }
+reqwest = { workspace = true }
 rusqlite = { workspace = true }
 directories = { workspace = true }
 lru = { workspace = true }
