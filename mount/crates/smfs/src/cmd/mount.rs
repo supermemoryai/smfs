@@ -69,7 +69,23 @@ pub async fn run(args: Args) -> Result<()> {
     #[allow(unsafe_code)]
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
 
-    // 4. Build MountOpts.
+    // 4. Write .smfs marker in the parent directory.
+    let marker_path = mount_path
+        .parent()
+        .unwrap_or(&mount_path)
+        .join(".smfs");
+    let api_url_str = args.api_url.as_deref().unwrap_or("https://api.supermemory.ai");
+    std::fs::write(
+        &marker_path,
+        format!(
+            "container_tag={}\napi_url={}\nmount_path={}\n",
+            args.container_tag,
+            api_url_str,
+            mount_path.display(),
+        ),
+    )?;
+
+    // 5. Build MountOpts.
     let opts = MountOpts::new(mount_path, backend).with_ownership(uid, gid);
 
     // 5. Open SQLite cache and create SupermemoryFs.
@@ -114,5 +130,6 @@ pub async fn run(args: Args) -> Result<()> {
     eprintln!("\nunmounting...");
 
     drop(handle);
+    let _ = std::fs::remove_file(&marker_path);
     Ok(())
 }

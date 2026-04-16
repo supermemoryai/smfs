@@ -13,6 +13,7 @@ use clap::Subcommand;
 
 pub mod daemon_inner;
 pub mod grep;
+pub mod init;
 pub mod login;
 pub mod mount;
 pub mod status;
@@ -38,6 +39,9 @@ pub enum Command {
     /// Semantic search across files in a container
     Grep(grep::Args),
 
+    /// Install the grep shell wrapper for transparent semantic search
+    Init(init::Args),
+
     /// Force a sync cycle now
     Sync,
 
@@ -52,6 +56,7 @@ pub async fn dispatch(cmd: Command) -> Result<()> {
         Command::Login(args) => login::run(args).await,
         Command::Mount(args) => mount::run(args).await,
         Command::Grep(args) => grep::run(args).await,
+        Command::Init(args) => init::run(args).await,
         Command::Unmount(args) => unmount::run(args).await,
         Command::Status => status::run().await,
         Command::Sync => sync::run().await,

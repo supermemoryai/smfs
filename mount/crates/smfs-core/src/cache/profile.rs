@@ -10,7 +10,7 @@ use crate::vfs::error::{VfsError, VfsResult};
 use crate::vfs::mode::S_IFREG;
 use crate::vfs::types::{FileAttr, Timestamp};
 
-pub const PROFILE_INO: u64 = 2;
+pub const PROFILE_INO: u64 = u64::MAX - 1;
 pub const PROFILE_NAME: &str = "profile.md";
 
 /// A virtual read-only file that shows the user's memory profile.

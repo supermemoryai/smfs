@@ -26,7 +26,14 @@ pub struct Args {
 }
 
 /// Read the `.smfs` marker file to get container tag and API URL.
-fn read_smfs_marker() -> Option<(String, String)> {
+#[allow(dead_code)]
+struct SmfsMarker {
+    tag: String,
+    api_url: String,
+    mount_path: Option<String>,
+}
+
+fn read_smfs_marker() -> Option<SmfsMarker> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
         let marker = dir.join(".smfs");
@@ -34,6 +41,7 @@ fn read_smfs_marker() -> Option<(String, String)> {
             let content = std::fs::read_to_string(&marker).ok()?;
             let mut tag = None;
             let mut url = None;
+            let mut mount_path = None;
             for line in content.lines() {
                 if let Some(v) = line.strip_prefix("container_tag=") {
                     tag = Some(v.to_string());
@@ -41,8 +49,15 @@ fn read_smfs_marker() -> Option<(String, String)> {
                 if let Some(v) = line.strip_prefix("api_url=") {
                     url = Some(v.to_string());
                 }
+                if let Some(v) = line.strip_prefix("mount_path=") {
+                    mount_path = Some(v.to_string());
+                }
             }
-            return Some((tag?, url.unwrap_or_else(|| "https://api.supermemory.ai".to_string())));
+            return Some(SmfsMarker {
+                tag: tag?,
+                api_url: url.unwrap_or_else(|| "https://api.supermemory.ai".to_string()),
+                mount_path,
+            });
         }
         if !dir.pop() {
             break;
@@ -59,9 +74,9 @@ pub async fn run(args: Args) -> Result<()> {
             .clone()
             .unwrap_or_else(|| "https://api.supermemory.ai".to_string());
         (tag.clone(), url)
-    } else if let Some((tag, url)) = read_smfs_marker() {
-        let url = args.api_url.clone().unwrap_or(url);
-        (tag, url)
+    } else if let Some(marker) = read_smfs_marker() {
+        let url = args.api_url.clone().unwrap_or(marker.api_url);
+        (marker.tag, url)
     } else {
         anyhow::bail!(
             "No container tag found. Either run from inside a mounted directory or pass --tag."
