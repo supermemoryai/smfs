@@ -148,6 +148,28 @@ impl ApiClient {
             .await
     }
 
+    /// Semantic search across memories and chunks.
+    pub async fn search(
+        &self,
+        query: &str,
+        filepath: Option<&str>,
+    ) -> Result<SearchResp, ApiError> {
+        let body = SearchReq {
+            q: query.to_string(),
+            container_tag: self.container_tag.clone(),
+            search_mode: "hybrid".to_string(),
+            filepath: filepath.map(String::from),
+            include: SearchInclude { documents: true },
+        };
+
+        self.post("/v4/search")
+            .json(&body)
+            .send_with_retry()
+            .await?
+            .parse_json()
+            .await
+    }
+
     /// Get the memory profile for the container tag.
     pub async fn get_profile(&self) -> Result<ProfileResp, ApiError> {
         let body = ProfileReq {

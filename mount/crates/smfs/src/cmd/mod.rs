@@ -12,6 +12,7 @@ use anyhow::Result;
 use clap::Subcommand;
 
 pub mod daemon_inner;
+pub mod grep;
 pub mod login;
 pub mod mount;
 pub mod status;
@@ -34,6 +35,9 @@ pub enum Command {
     /// Show status of the running daemon
     Status,
 
+    /// Semantic search across files in a container
+    Grep(grep::Args),
+
     /// Force a sync cycle now
     Sync,
 
@@ -47,6 +51,7 @@ pub async fn dispatch(cmd: Command) -> Result<()> {
     match cmd {
         Command::Login(args) => login::run(args).await,
         Command::Mount(args) => mount::run(args).await,
+        Command::Grep(args) => grep::run(args).await,
         Command::Unmount(args) => unmount::run(args).await,
         Command::Status => status::run().await,
         Command::Sync => sync::run().await,

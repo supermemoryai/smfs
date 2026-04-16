@@ -109,3 +109,37 @@ pub struct Profile {
     pub static_memories: Option<Vec<String>>,
     pub dynamic: Option<Vec<String>>,
 }
+
+/// POST /v4/search
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchReq {
+    pub q: String,
+    pub container_tag: String,
+    pub search_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filepath: Option<String>,
+    pub include: SearchInclude,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchInclude {
+    pub documents: bool,
+}
+
+/// Response from POST /v4/search
+#[derive(Debug, Deserialize)]
+pub struct SearchResp {
+    pub results: Vec<SearchResult>,
+    pub timing: Option<f64>,
+    pub total: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchResult {
+    pub id: String,
+    pub memory: Option<String>,
+    pub chunk: Option<String>,
+    pub similarity: f64,
+    pub filepath: Option<String>,
+}
