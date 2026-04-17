@@ -108,6 +108,32 @@ impl Db {
         Ok(())
     }
 
+    /// Look up the remote document ID for an inode, if one has been stored.
+    pub(crate) fn get_remote_id(&self, ino: u64) -> Option<String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT remote_id FROM fs_remote WHERE ino = ?1",
+            [ino as i64],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    /// Store or update the remote document ID for an inode.
+    pub(crate) fn set_remote_id(&self, ino: u64, remote_id: &str) {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO fs_remote (ino, remote_id) VALUES (?1, ?2)",
+            rusqlite::params![ino as i64, remote_id],
+        );
+    }
+
+    /// Remove the remote document ID mapping for an inode.
+    pub(crate) fn delete_remote_id(&self, ino: u64) {
+        let conn = self.conn.lock();
+        let _ = conn.execute("DELETE FROM fs_remote WHERE ino = ?1", [ino as i64]);
+    }
+
     /// Read a `FileAttr` from an fs_inode row.
     #[allow(dead_code)] // used by SupermemoryFs in M5b
     pub(crate) fn row_to_attr(row: &rusqlite::Row) -> rusqlite::Result<FileAttr> {
@@ -185,6 +211,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(chunk, "4096");
+    }
+
+    #[test]
+    fn get_remote_id_returns_none_for_missing() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.get_remote_id(42), None);
+    }
+
+    #[test]
+    fn set_then_get_remote_id_round_trips() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_remote_id(42, "doc-abc-123");
+        assert_eq!(db.get_remote_id(42), Some("doc-abc-123".to_string()));
+    }
+
+    #[test]
+    fn delete_remote_id_clears_mapping() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_remote_id(42, "doc-abc-123");
+        db.delete_remote_id(42);
+        assert_eq!(db.get_remote_id(42), None);
+    }
+
+    #[test]
+    fn set_remote_id_overwrites_existing() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_remote_id(42, "old-id");
+        db.set_remote_id(42, "new-id");
+        assert_eq!(db.get_remote_id(42), Some("new-id".to_string()));
     }
 
     #[test]

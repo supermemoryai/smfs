@@ -57,7 +57,7 @@ impl ApiClient {
         let http = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .map_err(|e| ApiError::Network(e))?;
+            .map_err(ApiError::Network)?;
 
         let url = format!("{}/v3/session", base_url.trim_end_matches('/'));
         let resp = http
@@ -92,10 +92,7 @@ impl ApiClient {
     }
 
     /// List documents, optionally filtered by filepath prefix or exact match.
-    pub async fn list_documents(
-        &self,
-        filepath: Option<&str>,
-    ) -> Result<Vec<Document>, ApiError> {
+    pub async fn list_documents(&self, filepath: Option<&str>) -> Result<Vec<Document>, ApiError> {
         let mut page = 1u32;
         let mut all = Vec::new();
 
@@ -158,11 +155,7 @@ impl ApiClient {
     }
 
     /// Update a document (filepath, content, or both).
-    pub async fn update_document(
-        &self,
-        id: &str,
-        req: &UpdateDocumentReq,
-    ) -> Result<(), ApiError> {
+    pub async fn update_document(&self, id: &str, req: &UpdateDocumentReq) -> Result<(), ApiError> {
         self.patch(&format!("/v3/documents/{id}"))
             .json(req)
             .send_with_retry()
@@ -171,10 +164,7 @@ impl ApiClient {
     }
 
     /// Bulk delete documents by filepath prefix or exact match.
-    pub async fn delete_documents(
-        &self,
-        filepath: &str,
-    ) -> Result<BulkDeleteResp, ApiError> {
+    pub async fn delete_documents(&self, filepath: &str) -> Result<BulkDeleteResp, ApiError> {
         let body = BulkDeleteReq {
             ids: None,
             container_tags: Some(vec![self.container_tag.clone()]),
@@ -309,9 +299,7 @@ impl RetryableRequest {
                     }
 
                     // Retry 429 and 5xx
-                    if status == StatusCode::TOO_MANY_REQUESTS
-                        || status.is_server_error()
-                    {
+                    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                         if attempt < MAX_RETRIES - 1 {
                             tracing::warn!(
                                 status = status.as_u16(),

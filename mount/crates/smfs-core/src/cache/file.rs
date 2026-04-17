@@ -248,7 +248,9 @@ impl crate::vfs::File for SqliteFile {
         // SQLite writes are already durable after each transaction commit.
         // If we have an API client, push the file content to the cloud.
         let Some(api) = &self.api else { return Ok(()) };
-        let Some(filepath) = &self.filepath else { return Ok(()) };
+        let Some(filepath) = &self.filepath else {
+            return Ok(());
+        };
 
         let size: i64 = {
             let conn = self.db.conn.lock();
@@ -265,14 +267,48 @@ impl crate::vfs::File for SqliteFile {
         }
 
         let content = self.read(0, size as usize).await?;
-        let text = String::from_utf8_lossy(&content);
+        let text = String::from_utf8_lossy(&content).into_owned();
 
-        match api.create_document(&text, filepath).await {
-            Ok(resp) => {
-                tracing::debug!(filepath, doc_id = %resp.id, "pushed to API");
+        // Check if this inode already has a remote document.
+        let existing_remote_id = self.db.get_remote_id(self.ino);
+
+        if let Some(remote_id) = existing_remote_id {
+            // Existing document — PATCH to update content.
+            let req = crate::api::UpdateDocumentReq {
+                filepath: Some(filepath.clone()),
+                content: Some(text.clone()),
+            };
+            match api.update_document(&remote_id, &req).await {
+                Ok(()) => {
+                    tracing::debug!(filepath, doc_id = %remote_id, "updated in API (PATCH)");
+                }
+                Err(crate::api::ApiError::NotFound) => {
+                    // Remote doc was deleted externally. Clear stale mapping and re-create.
+                    self.db.delete_remote_id(self.ino);
+                    match api.create_document(&text, filepath).await {
+                        Ok(resp) => {
+                            self.db.set_remote_id(self.ino, &resp.id);
+                            tracing::debug!(filepath, doc_id = %resp.id, "re-created in API after 404");
+                        }
+                        Err(e) => {
+                            tracing::warn!(filepath, error = %e, "failed to re-create in API");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(filepath, doc_id = %remote_id, error = %e, "failed to update in API");
+                }
             }
-            Err(e) => {
-                tracing::warn!(filepath, error = %e, "failed to push to API");
+        } else {
+            // New document — POST to create, then store the returned ID.
+            match api.create_document(&text, filepath).await {
+                Ok(resp) => {
+                    self.db.set_remote_id(self.ino, &resp.id);
+                    tracing::debug!(filepath, doc_id = %resp.id, "created in API (POST)");
+                }
+                Err(e) => {
+                    tracing::warn!(filepath, error = %e, "failed to create in API");
+                }
             }
         }
 

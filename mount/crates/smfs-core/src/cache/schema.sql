@@ -48,3 +48,10 @@ CREATE TABLE IF NOT EXISTS fs_config (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Remote document ID tracking. Maps local inode → Supermemory API document ID.
+-- Populated on first successful flush (POST), used for subsequent updates (PATCH).
+CREATE TABLE IF NOT EXISTS fs_remote (
+    ino       INTEGER PRIMARY KEY,
+    remote_id TEXT    NOT NULL
+);

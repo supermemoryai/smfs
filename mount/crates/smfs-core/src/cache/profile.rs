@@ -38,10 +38,7 @@ impl ProfileFile {
 
         let content = match self.api.get_profile().await {
             Ok(resp) => format_profile(&resp),
-            Err(e) => format!(
-                "# Memory Profile\n\n(Failed to load profile: {})\n",
-                e
-            ),
+            Err(e) => format!("# Memory Profile\n\n(Failed to load profile: {})\n", e),
         };
 
         let bytes = content.into_bytes();

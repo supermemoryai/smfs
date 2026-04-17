@@ -564,7 +564,10 @@ impl FileSystem for SupermemoryFs {
         }; // conn dropped here
 
         let append_profile = |mut entries: Vec<DirEntry>| -> Vec<DirEntry> {
-            if ino == ROOT_INO && self.api.is_some() && !entries.iter().any(|e| e.name == PROFILE_NAME) {
+            if ino == ROOT_INO
+                && self.api.is_some()
+                && !entries.iter().any(|e| e.name == PROFILE_NAME)
+            {
                 entries.push(DirEntry {
                     name: PROFILE_NAME.to_string(),
                     attr: ProfileFile::profile_attr(),
@@ -926,6 +929,8 @@ impl FileSystem for SupermemoryFs {
                 .map_err(sql_err)?;
             tx.execute("DELETE FROM fs_symlink WHERE ino = ?1", [child_ino])
                 .map_err(sql_err)?;
+            tx.execute("DELETE FROM fs_remote WHERE ino = ?1", [child_ino])
+                .map_err(sql_err)?;
             tx.execute("DELETE FROM fs_inode WHERE ino = ?1", [child_ino])
                 .map_err(sql_err)?;
         }
@@ -943,8 +948,12 @@ impl FileSystem for SupermemoryFs {
                 let api = api.clone();
                 tokio::spawn(async move {
                     match api.delete_documents(&fp).await {
-                        Ok(r) => tracing::debug!(filepath = %fp, deleted = r.deleted_count, "deleted from API"),
-                        Err(e) => tracing::warn!(filepath = %fp, error = %e, "failed to delete from API"),
+                        Ok(r) => {
+                            tracing::debug!(filepath = %fp, deleted = r.deleted_count, "deleted from API")
+                        }
+                        Err(e) => {
+                            tracing::warn!(filepath = %fp, error = %e, "failed to delete from API")
+                        }
                     }
                 });
             }
@@ -1152,97 +1161,107 @@ impl FileSystem for SupermemoryFs {
             format!("{p}{sep}{old_name}")
         });
 
+        // Resolve destination filepath BEFORE rename (needed to delete overwritten doc from API).
+        let dst_filepath_for_delete = self.resolve_filepath(new_parent_ino).map(|p| {
+            let sep = if p.ends_with('/') { "" } else { "/" };
+            format!("{p}{sep}{new_name}")
+        });
+
         // All DB work in a block so conn/tx are dropped before any .await.
-        let src_ino = {
-        let conn = self.db.conn.lock();
+        let (src_ino, did_overwrite) = {
+            let conn = self.db.conn.lock();
 
-        // Find source.
-        let src_ino: i64 = conn
-            .query_row(
-                "SELECT ino FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
-                rusqlite::params![old_parent_ino as i64, old_name],
-                |r| r.get(0),
-            )
-            .map_err(|_| VfsError::NotFound)?;
+            // Find source.
+            let src_ino: i64 = conn
+                .query_row(
+                    "SELECT ino FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
+                    rusqlite::params![old_parent_ino as i64, old_name],
+                    |r| r.get(0),
+                )
+                .map_err(|_| VfsError::NotFound)?;
 
-        // Verify destination parent is a directory.
-        let dst_parent_mode: i64 = conn
-            .query_row(
-                "SELECT mode FROM fs_inode WHERE ino = ?1",
-                [new_parent_ino as i64],
-                |r| r.get(0),
-            )
-            .map_err(|_| VfsError::NotFound)?;
-        if (dst_parent_mode as u32 & S_IFMT) != S_IFDIR {
-            return Err(VfsError::NotADirectory);
-        }
-
-        // Check if destination exists.
-        let dst_existing: Option<i64> = conn
-            .query_row(
-                "SELECT ino FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
-                rusqlite::params![new_parent_ino as i64, new_name],
-                |r| r.get(0),
-            )
-            .ok();
-
-        let src_mode: i64 = conn
-            .query_row("SELECT mode FROM fs_inode WHERE ino = ?1", [src_ino], |r| {
-                r.get(0)
-            })
-            .map_err(sql_err)?;
-        let src_is_dir = (src_mode as u32 & S_IFMT) == S_IFDIR;
-
-        let tx = conn.unchecked_transaction().map_err(sql_err)?;
-
-        if let Some(dst_ino) = dst_existing {
-            if dst_ino == src_ino {
-                return Ok(()); // rename-to-same — no-op
+            // Verify destination parent is a directory.
+            let dst_parent_mode: i64 = conn
+                .query_row(
+                    "SELECT mode FROM fs_inode WHERE ino = ?1",
+                    [new_parent_ino as i64],
+                    |r| r.get(0),
+                )
+                .map_err(|_| VfsError::NotFound)?;
+            if (dst_parent_mode as u32 & S_IFMT) != S_IFDIR {
+                return Err(VfsError::NotADirectory);
             }
 
-            let dst_mode: i64 = tx
-                .query_row("SELECT mode FROM fs_inode WHERE ino = ?1", [dst_ino], |r| {
+            // Check if destination exists.
+            let dst_existing: Option<i64> = conn
+                .query_row(
+                    "SELECT ino FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
+                    rusqlite::params![new_parent_ino as i64, new_name],
+                    |r| r.get(0),
+                )
+                .ok();
+            let mut did_overwrite = false;
+
+            let src_mode: i64 = conn
+                .query_row("SELECT mode FROM fs_inode WHERE ino = ?1", [src_ino], |r| {
                     r.get(0)
                 })
                 .map_err(sql_err)?;
-            let dst_is_dir = (dst_mode as u32 & S_IFMT) == S_IFDIR;
+            let src_is_dir = (src_mode as u32 & S_IFMT) == S_IFDIR;
 
-            match (src_is_dir, dst_is_dir) {
-                (true, false) => return Err(VfsError::NotADirectory),
-                (false, true) => return Err(VfsError::IsADirectory),
-                (true, true) => {
-                    let count: i64 = tx
-                        .query_row(
-                            "SELECT COUNT(*) FROM fs_dentry WHERE parent_ino = ?1",
-                            [dst_ino],
-                            |r| r.get(0),
-                        )
-                        .map_err(sql_err)?;
-                    if count > 0 {
-                        return Err(VfsError::NotEmpty);
-                    }
+            let tx = conn.unchecked_transaction().map_err(sql_err)?;
+
+            if let Some(dst_ino) = dst_existing {
+                if dst_ino == src_ino {
+                    return Ok(()); // rename-to-same — no-op
                 }
-                (false, false) => {}
+
+                let dst_mode: i64 = tx
+                    .query_row("SELECT mode FROM fs_inode WHERE ino = ?1", [dst_ino], |r| {
+                        r.get(0)
+                    })
+                    .map_err(sql_err)?;
+                let dst_is_dir = (dst_mode as u32 & S_IFMT) == S_IFDIR;
+
+                match (src_is_dir, dst_is_dir) {
+                    (true, false) => return Err(VfsError::NotADirectory),
+                    (false, true) => return Err(VfsError::IsADirectory),
+                    (true, true) => {
+                        let count: i64 = tx
+                            .query_row(
+                                "SELECT COUNT(*) FROM fs_dentry WHERE parent_ino = ?1",
+                                [dst_ino],
+                                |r| r.get(0),
+                            )
+                            .map_err(sql_err)?;
+                        if count > 0 {
+                            return Err(VfsError::NotEmpty);
+                        }
+                    }
+                    (false, false) => {}
+                }
+
+                // Remove destination.
+                tx.execute(
+                    "DELETE FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
+                    rusqlite::params![new_parent_ino as i64, new_name],
+                )
+                .map_err(sql_err)?;
+                tx.execute("DELETE FROM fs_data WHERE ino = ?1", [dst_ino])
+                    .map_err(sql_err)?;
+                tx.execute("DELETE FROM fs_symlink WHERE ino = ?1", [dst_ino])
+                    .map_err(sql_err)?;
+                tx.execute("DELETE FROM fs_remote WHERE ino = ?1", [dst_ino])
+                    .map_err(sql_err)?;
+                tx.execute("DELETE FROM fs_inode WHERE ino = ?1", [dst_ino])
+                    .map_err(sql_err)?;
+                did_overwrite = true;
             }
 
-            // Remove destination.
+            let now = Timestamp::now();
+
+            // Atomic rename: update the dentry.
             tx.execute(
-                "DELETE FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
-                rusqlite::params![new_parent_ino as i64, new_name],
-            )
-            .map_err(sql_err)?;
-            tx.execute("DELETE FROM fs_data WHERE ino = ?1", [dst_ino])
-                .map_err(sql_err)?;
-            tx.execute("DELETE FROM fs_symlink WHERE ino = ?1", [dst_ino])
-                .map_err(sql_err)?;
-            tx.execute("DELETE FROM fs_inode WHERE ino = ?1", [dst_ino])
-                .map_err(sql_err)?;
-        }
-
-        let now = Timestamp::now();
-
-        // Atomic rename: update the dentry.
-        tx.execute(
             "UPDATE fs_dentry SET parent_ino = ?1, name = ?2 WHERE parent_ino = ?3 AND name = ?4",
             rusqlite::params![
                 new_parent_ino as i64,
@@ -1253,30 +1272,30 @@ impl FileSystem for SupermemoryFs {
         )
         .map_err(sql_err)?;
 
-        // Update timestamps on source inode and both parents.
-        tx.execute(
-            "UPDATE fs_inode SET ctime = ?1, ctime_nsec = ?2 WHERE ino = ?3",
-            rusqlite::params![now.sec, now.nsec, src_ino],
-        )
-        .map_err(sql_err)?;
+            // Update timestamps on source inode and both parents.
+            tx.execute(
+                "UPDATE fs_inode SET ctime = ?1, ctime_nsec = ?2 WHERE ino = ?3",
+                rusqlite::params![now.sec, now.nsec, src_ino],
+            )
+            .map_err(sql_err)?;
 
-        tx.execute(
+            tx.execute(
             "UPDATE fs_inode SET mtime = ?1, ctime = ?2, mtime_nsec = ?3, ctime_nsec = ?4 WHERE ino = ?5",
             rusqlite::params![now.sec, now.sec, now.nsec, now.nsec, old_parent_ino as i64],
         )
         .map_err(sql_err)?;
 
-        if new_parent_ino != old_parent_ino {
-            tx.execute(
+            if new_parent_ino != old_parent_ino {
+                tx.execute(
                 "UPDATE fs_inode SET mtime = ?1, ctime = ?2, mtime_nsec = ?3, ctime_nsec = ?4 WHERE ino = ?5",
                 rusqlite::params![now.sec, now.sec, now.nsec, now.nsec, new_parent_ino as i64],
             )
             .map_err(sql_err)?;
-        }
+            }
 
-        tx.commit().map_err(sql_err)?;
+            tx.commit().map_err(sql_err)?;
 
-        src_ino
+            (src_ino, did_overwrite)
         }; // conn + tx dropped here
 
         {
@@ -1292,6 +1311,26 @@ impl FileSystem for SupermemoryFs {
             format!("{p}{sep}{new_name}")
         });
 
+        // Delete overwritten destination from API.
+        if did_overwrite {
+            if let Some(ref api) = self.api {
+                if let Some(ref dst_fp) = dst_filepath_for_delete {
+                    let api = api.clone();
+                    let dst_fp = dst_fp.clone();
+                    tokio::spawn(async move {
+                        match api.delete_documents(&dst_fp).await {
+                            Ok(r) => {
+                                tracing::debug!(filepath = %dst_fp, deleted = r.deleted_count, "deleted overwritten file from API")
+                            }
+                            Err(e) => {
+                                tracing::warn!(filepath = %dst_fp, error = %e, "failed to delete overwritten file from API")
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
         // Push rename to API.
         if let Some(ref api) = self.api {
             if let (Some(old_fp), Some(new_fp)) = (old_filepath, new_filepath) {
@@ -1303,12 +1342,18 @@ impl FileSystem for SupermemoryFs {
                                 content: None,
                             };
                             match api.update_document(&doc.id, &req).await {
-                                Ok(_) => tracing::debug!(old = %old_fp, new = %new_fp, "renamed in API"),
-                                Err(e) => tracing::warn!(old = %old_fp, error = %e, "API rename failed"),
+                                Ok(_) => {
+                                    tracing::debug!(old = %old_fp, new = %new_fp, "renamed in API")
+                                }
+                                Err(e) => {
+                                    tracing::warn!(old = %old_fp, error = %e, "API rename failed")
+                                }
                             }
                         }
                     }
-                    Err(e) => tracing::warn!(old = %old_fp, error = %e, "API list for rename failed"),
+                    Err(e) => {
+                        tracing::warn!(old = %old_fp, error = %e, "API list for rename failed")
+                    }
                 }
             }
         }

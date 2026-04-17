@@ -46,7 +46,10 @@ pub async fn run(args: Args) -> Result<()> {
         );
     };
 
-    let mount_path = marker.as_ref().and_then(|m| m.mount_path.as_deref()).map(std::path::Path::new);
+    let mount_path = marker
+        .as_ref()
+        .and_then(|m| m.mount_path.as_deref())
+        .map(std::path::Path::new);
     let key = super::auth::resolve_api_key(args.key.as_deref(), mount_path)?;
 
     let client = smfs_core::api::ApiClient::new(&api_url, &key, &tag);
@@ -67,9 +70,7 @@ pub async fn run(args: Args) -> Result<()> {
         }
     });
 
-    let resp = client
-        .search(&args.query, filepath.as_deref())
-        .await?;
+    let resp = client.search(&args.query, filepath.as_deref()).await?;
 
     if resp.results.is_empty() {
         eprintln!("[supermemory] No results for {:?}", args.query);

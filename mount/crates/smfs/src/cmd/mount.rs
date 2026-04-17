@@ -71,11 +71,11 @@ pub async fn run(args: Args) -> Result<()> {
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
 
     // 4. Write .smfs marker in the parent directory.
-    let marker_path = mount_path
-        .parent()
-        .unwrap_or(&mount_path)
-        .join(".smfs");
-    let api_url_str = args.api_url.as_deref().unwrap_or("https://api.supermemory.ai");
+    let marker_path = mount_path.parent().unwrap_or(&mount_path).join(".smfs");
+    let api_url_str = args
+        .api_url
+        .as_deref()
+        .unwrap_or("https://api.supermemory.ai");
     std::fs::write(
         &marker_path,
         format!(
@@ -131,7 +131,9 @@ pub async fn run(args: Args) -> Result<()> {
 
     // Auto-install grep wrapper on first mount.
     if let Ok(true) = super::init::ensure_grep_wrapper_installed() {
-        eprintln!("semantic grep enabled. run: source ~/.zshrc (new terminals have it automatically)");
+        eprintln!(
+            "semantic grep enabled. run: source ~/.zshrc (new terminals have it automatically)"
+        );
     }
 
     eprintln!(
