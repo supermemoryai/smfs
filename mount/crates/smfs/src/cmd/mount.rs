@@ -61,7 +61,8 @@ pub async fn run(args: Args) -> Result<()> {
             .expect("cannot determine current directory")
             .join(&args.container_tag)
     });
-    if !mount_path.exists() {
+    let created_dir = !mount_path.exists();
+    if created_dir {
         std::fs::create_dir_all(&mount_path)?;
     }
 
@@ -86,6 +87,7 @@ pub async fn run(args: Args) -> Result<()> {
     )?;
 
     // 5. Build MountOpts.
+    let mount_path_copy = mount_path.clone();
     let opts = MountOpts::new(mount_path, backend).with_ownership(uid, gid);
 
     // 5. Open SQLite cache and create SupermemoryFs.
@@ -130,11 +132,33 @@ pub async fn run(args: Args) -> Result<()> {
         handle.backend(),
     );
 
-    // 6. Hold mount until Ctrl+C.
+    // 6. Hold mount until Ctrl+C or SIGTERM.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("register SIGTERM");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     eprintln!("\nunmounting...");
 
     drop(handle);
+    // Explicitly unmount in case the handle drop didn't (Linux FUSE).
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("umount")
+            .arg(&mount_path_copy)
+            .output();
+    }
+    // Wait for kernel to release the mount before cleanup.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     let _ = std::fs::remove_file(&marker_path);
+    if created_dir {
+        let _ = std::fs::remove_dir(&mount_path_copy);
+    }
     Ok(())
 }
