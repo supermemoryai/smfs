@@ -177,6 +177,7 @@ impl ApiClient {
     ) -> Result<BulkDeleteResp, ApiError> {
         let body = BulkDeleteReq {
             ids: None,
+            container_tags: Some(vec![self.container_tag.clone()]),
             filepath: Some(filepath.to_string()),
         };
 

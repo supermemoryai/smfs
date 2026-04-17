@@ -79,6 +79,8 @@ pub struct BulkDeleteReq {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ids: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub filepath: Option<String>,
 }
 
