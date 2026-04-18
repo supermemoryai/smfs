@@ -1,33 +1,170 @@
 //! Background sync engine.
 //!
-//! Bridges the local SQLite cache and the Supermemory API. Handles both
-//! directions:
+//! Two loops today:
 //!
-//! - **Pull** — on directory TTL expiry or cache miss, fetch from the API
-//!   and populate inodes/chunks in the cache.
-//! - **Push** — drain the `sync_queue` table, uploading dirty inodes to the
-//!   API with exponential-backoff retry.
+//! - **Delta pull** — every ~30s, walk `/v3/documents/list` sorted by
+//!   `updatedAt desc` and reconcile anything newer than our watermark into
+//!   the local cache.
+//! - **Deletion scan** — every ~5min, diff the full remote ID set against
+//!   the local `fs_remote` table and unlink anything that disappeared.
 //!
-//! The sync engine is a single long-running tokio task spawned alongside the
-//! mount. It wakes up on explicit notification (when the VFS marks an inode
-//! dirty) or on a poll interval (to discover work the notify path missed).
-//!
-//! ## Planned contents
-//!
-//! **M7 — pull path:**
-//! - `sync_directory(db, api, dir_ino)` — list remote docs in a path prefix,
-//!   reconcile with local inodes/dentries, update `fs_dir_cache.last_listed_at`
-//! - `sync_file_content(db, api, ino)` — fetch remote content, replace local
-//!   `fs_data` chunks, mark inode clean
-//! - `/unfiled/{doc_id}` fallback for documents without a `filepath` field
-//!
-//! **M8 — push path:**
-//! - `push_job(db, api, job)` — handle `Upload`/`Update`/`Delete`/`Rename` ops
-//! - `SyncEngine::run(shutdown)` — the polling loop with `notify.notified()`
-//!   and exponential backoff on failures
-//! - State transitions: `dirty → pushing → clean | error`
-//!
-//! See `.plan/v0-plan.md` milestones M7 and M8 for the detailed spec.
+//! The push queue (write-side coalescing, inflight status polling, unmount
+//! drain) is a planned follow-up; the schema and DB helpers for it already
+//! exist in `cache/db.rs` so layering it on top won't require structural
+//! change.
 
-// TODO(M7): pull path — sync_directory, sync_file_content.
-// TODO(M8): push path — push_job, SyncEngine::run, backoff policy.
+pub mod pull;
+pub mod scan;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::watch;
+use tokio::task::JoinSet;
+
+use crate::cache::SupermemoryFs;
+
+/// Knobs for the sync engine. All optional — defaults are production-sane.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncOptions {
+    pub delta_interval: Duration,
+    pub deletion_scan_interval: Duration,
+}
+
+impl Default for SyncOptions {
+    fn default() -> Self {
+        Self {
+            delta_interval: Duration::from_secs(30),
+            deletion_scan_interval: Duration::from_secs(300),
+        }
+    }
+}
+
+/// Orchestrates background sync for a mount. Spawn with [`SyncEngine::start`]
+/// and signal shutdown via the `watch::Sender<bool>` (true = stop).
+#[derive(Debug)]
+pub struct SyncEngine;
+
+impl SyncEngine {
+    /// Run the synchronous startup sequence: a full deletion scan first (to
+    /// catch anything deleted while we were offline) and a full pull (to
+    /// hydrate everything else). Blocks until both complete.
+    pub async fn initial_pull(fs: &Arc<SupermemoryFs>) -> anyhow::Result<(usize, usize)> {
+        let removed = scan::deletion_scan(fs).await.unwrap_or(0);
+        let reconciled = pull::full_pull(fs).await?;
+        Ok((removed, reconciled))
+    }
+
+    /// Spawn loops A (delta pull) and C (deletion scan). Returns a JoinSet
+    /// whose tasks exit when `shutdown.send(true)` is called.
+    pub fn start(
+        fs: Arc<SupermemoryFs>,
+        opts: SyncOptions,
+        shutdown: watch::Receiver<bool>,
+    ) -> JoinSet<()> {
+        let mut set = JoinSet::new();
+
+        let fs_a = fs.clone();
+        let mut sd_a = shutdown.clone();
+        set.spawn(async move {
+            run_delta_loop(fs_a, opts.delta_interval, &mut sd_a).await;
+        });
+
+        let fs_c = fs.clone();
+        let mut sd_c = shutdown.clone();
+        set.spawn(async move {
+            run_deletion_loop(fs_c, opts.deletion_scan_interval, &mut sd_c).await;
+        });
+
+        set
+    }
+
+    /// Final deletion scan before the mount releases. Best-effort: logs on
+    /// failure and returns.
+    pub async fn unmount_scan(fs: &Arc<SupermemoryFs>) {
+        match scan::deletion_scan(fs).await {
+            Ok(n) if n > 0 => tracing::info!(removed = n, "final deletion scan"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "final deletion scan failed"),
+        }
+    }
+}
+
+async fn run_delta_loop(
+    fs: Arc<SupermemoryFs>,
+    base_interval: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    let mut empty_streak = 0u32;
+    loop {
+        let interval = adaptive_interval(base_interval, empty_streak);
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { return; }
+            }
+        }
+
+        match pull::delta_pull(&fs).await {
+            Ok(n) => {
+                if n == 0 {
+                    empty_streak = empty_streak.saturating_add(1);
+                } else {
+                    empty_streak = 0;
+                    tracing::debug!(reconciled = n, "delta pull");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "delta pull failed");
+            }
+        }
+    }
+}
+
+async fn run_deletion_loop(
+    fs: Arc<SupermemoryFs>,
+    base_interval: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    loop {
+        let interval = jittered(base_interval, 30);
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { return; }
+            }
+        }
+
+        match scan::deletion_scan(&fs).await {
+            Ok(n) if n > 0 => tracing::info!(removed = n, "deletion scan"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "deletion scan failed"),
+        }
+    }
+}
+
+/// Adaptive cadence: shorter after activity, stretch when idle, add ±jitter.
+fn adaptive_interval(base: Duration, empty_streak: u32) -> Duration {
+    let secs = base.as_secs_f64();
+    let adjusted = if empty_streak == 0 {
+        (secs / 3.0).max(10.0)
+    } else if empty_streak >= 3 {
+        (secs * 2.0).min(60.0)
+    } else {
+        secs
+    };
+    jittered(Duration::from_secs_f64(adjusted), 5)
+}
+
+/// Add uniform ±`max_jitter_secs` jitter to an interval (never below 1s).
+fn jittered(base: Duration, max_jitter_secs: i64) -> Duration {
+    // Cheap pseudo-random from system time nanos; avoids pulling in a
+    // dedicated RNG crate for this one use.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as i64)
+        .unwrap_or(0);
+    let jitter = (nanos % (2 * max_jitter_secs + 1)) - max_jitter_secs;
+    let secs = (base.as_secs() as i64 + jitter).max(1);
+    Duration::from_secs(secs as u64)
+}

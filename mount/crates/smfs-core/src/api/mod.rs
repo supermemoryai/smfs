@@ -103,16 +103,11 @@ impl ApiClient {
                 limit: 100,
                 page,
                 include_content: Some(true),
+                sort: None,
+                order: None,
             };
 
-            let resp: ListDocumentsResp = self
-                .post("/v3/documents/list")
-                .json(&body)
-                .send_with_retry()
-                .await?
-                .parse_json()
-                .await?;
-
+            let resp = self.list_documents_page(&body).await?;
             let count = resp.memories.len();
             all.extend(resp.memories);
 
@@ -123,6 +118,21 @@ impl ApiClient {
         }
 
         Ok(all)
+    }
+
+    /// Fetch a single page from /v3/documents/list. Caller owns the request
+    /// shape (sort, order, limit, page). Used by the sync engine to walk
+    /// updatedAt-sorted pages and stop early at the watermark.
+    pub async fn list_documents_page(
+        &self,
+        body: &ListDocumentsReq,
+    ) -> Result<ListDocumentsResp, ApiError> {
+        self.post("/v3/documents/list")
+            .json(body)
+            .send_with_retry()
+            .await?
+            .parse_json()
+            .await
     }
 
     /// Get a single document by ID or customId.

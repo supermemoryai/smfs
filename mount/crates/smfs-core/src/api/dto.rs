@@ -54,6 +54,10 @@ pub struct ListDocumentsReq {
     pub page: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_content: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<String>,
 }
 
 /// Response from POST /v3/documents/list

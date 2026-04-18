@@ -185,7 +185,7 @@ impl SupermemoryFs {
         Ok(entries)
     }
 
-    /// Pull documents from the API and insert them into the local cache.
+    /// Pull documents from the API and reconcile each into the local cache.
     async fn pull_documents(&self, filepath_prefix: &str) -> VfsResult<()> {
         let api = match &self.api {
             Some(a) => a,
@@ -198,48 +198,139 @@ impl SupermemoryFs {
             .map_err(|e| VfsError::Io(std::io::Error::other(e.to_string())))?;
 
         for doc in &docs {
-            let filepath = match &doc.filepath {
-                Some(fp) => fp,
-                None => continue,
-            };
+            let _ = self.reconcile_one(doc);
+        }
 
-            // Split filepath into directory + filename
-            let (dir, filename) = match filepath.rfind('/') {
-                Some(pos) => {
-                    let dir = if pos == 0 { "/" } else { &filepath[..pos] };
-                    let name = &filepath[pos + 1..];
-                    (dir, name)
+        Ok(())
+    }
+
+    /// Reconcile a single remote document against the local cache.
+    /// Versioning rules: if local `dirty_since` is newer than the remote's
+    /// `updatedAt`, skip (local write in progress wins). Otherwise create,
+    /// rename, or rewrite chunks as needed.
+    pub(crate) fn reconcile_one(
+        &self,
+        doc: &crate::api::Document,
+    ) -> VfsResult<ReconcileOutcome> {
+        let filepath = match doc.filepath.as_deref() {
+            Some(fp) if !fp.is_empty() => fp,
+            _ => return Ok(ReconcileOutcome::Skipped),
+        };
+
+        let (dir, filename) = match filepath.rfind('/') {
+            Some(pos) => {
+                let dir = if pos == 0 { "/" } else { &filepath[..pos] };
+                let name = &filepath[pos + 1..];
+                (dir, name)
+            }
+            None => return Ok(ReconcileOutcome::Skipped),
+        };
+        if filename.is_empty() {
+            return Ok(ReconcileOutcome::Skipped);
+        }
+
+        let updated_ms = parse_iso_to_ms(&doc.updated_at);
+
+        // If an inode is already mapped to this remote_id, update it in place.
+        if let Some(existing_ino) = self.db.ino_by_remote_id(&doc.id) {
+            // Local write is newer — defer to push queue, don't clobber.
+            if let Some(dirty_since) = self.db.get_dirty_since(existing_ino) {
+                if let Some(ms) = updated_ms {
+                    if dirty_since > ms {
+                        return Ok(ReconcileOutcome::SkippedDirty);
+                    }
                 }
-                None => continue,
-            };
-
-            if filename.is_empty() {
-                continue;
             }
 
-            // Ensure parent directories exist
-            let parent_ino = self.ensure_dirs(dir)?;
-
-            // Check if file already exists in cache
-            {
-                let conn = self.db.conn.lock();
-                let exists: bool = conn
-                    .query_row(
-                        "SELECT 1 FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
-                        rusqlite::params![parent_ino as i64, filename],
-                        |_| Ok(()),
-                    )
-                    .is_ok();
-                if exists {
-                    continue;
+            // Have we already mirrored this version?
+            let mirrored = self
+                .db
+                .get_mirrored_state(existing_ino)
+                .and_then(|(u, _, _)| u);
+            if let (Some(m), Some(u)) = (mirrored, updated_ms) {
+                if m >= u && doc.status == "done" {
+                    return Ok(ReconcileOutcome::Unchanged);
                 }
             }
 
-            // Create file inode
-            let content = doc.content.as_deref().unwrap_or("");
-            let size = content.len() as i64;
-            let now = Timestamp::now();
+            // Handle rename: current resolved path vs remote filepath.
+            let current_fp = self.resolve_filepath(existing_ino);
+            if current_fp.as_deref() != Some(filepath) {
+                self.apply_rename_to(existing_ino, dir, filename)?;
+            }
 
+            // Only rewrite chunks when processing is complete — partial content
+            // from docs mid-pipeline would overwrite good local data. Critical:
+            // we also only advance `mirrored_updated_at` when we actually
+            // mirrored content. Otherwise a rapid PATCH burst caught
+            // mid-pipeline would leave `mirrored` set to the latest
+            // `updatedAt` while the local content still reflects an earlier
+            // version, and the next poll would skip re-reconciliation.
+            if doc.status == "done" {
+                if let Some(content) = doc.content.as_deref() {
+                    self.rewrite_file_content(existing_ino, content)?;
+                }
+                self.db.set_mirrored_state(
+                    existing_ino,
+                    updated_ms,
+                    Some(&doc.status),
+                    Some(now_ms()),
+                );
+            } else {
+                // In-progress: track status for observability but leave
+                // `mirrored_updated_at` alone so we keep re-polling until done.
+                self.db.set_mirrored_state(
+                    existing_ino,
+                    None,
+                    Some(&doc.status),
+                    Some(now_ms()),
+                );
+            }
+            return Ok(ReconcileOutcome::Updated);
+        }
+
+        // New doc (not yet mirrored locally) — create inode+dentry+chunks.
+        // Skip in-progress docs so we don't materialize partial content; the
+        // next poll after the doc reaches "done" will pick it up.
+        if doc.status != "done" {
+            return Ok(ReconcileOutcome::DeferredProcessing);
+        }
+
+        let parent_ino = self.ensure_dirs(dir)?;
+
+        // If something with this filename already exists (from a prior unmapped
+        // pull), attach the remote_id to that inode rather than creating a dup.
+        let existing_ino: Option<i64> = {
+            let conn = self.db.conn.lock();
+            conn.query_row(
+                "SELECT ino FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
+                rusqlite::params![parent_ino as i64, filename],
+                |r| r.get(0),
+            )
+            .ok()
+        };
+        if let Some(ino_i64) = existing_ino {
+            let ino = ino_i64 as u64;
+            self.db.set_remote_id(ino, &doc.id);
+            if doc.status == "done" {
+                if let Some(content) = doc.content.as_deref() {
+                    self.rewrite_file_content(ino, content)?;
+                }
+            }
+            self.db.set_mirrored_state(
+                ino,
+                updated_ms,
+                Some(&doc.status),
+                Some(now_ms()),
+            );
+            return Ok(ReconcileOutcome::Attached);
+        }
+
+        let content = doc.content.as_deref().unwrap_or("");
+        let size = content.len() as i64;
+        let now = Timestamp::now();
+
+        let file_ino = {
             let conn = self.db.conn.lock();
             conn.execute(
                 "INSERT INTO fs_inode (mode, nlink, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec)
@@ -252,35 +343,212 @@ impl SupermemoryFs {
                 ],
             )
             .map_err(sql_err)?;
-            let file_ino = conn.last_insert_rowid() as u64;
+            let ino = conn.last_insert_rowid() as u64;
 
-            // Create dentry
             conn.execute(
                 "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?1, ?2, ?3)",
-                rusqlite::params![filename, parent_ino as i64, file_ino as i64],
+                rusqlite::params![filename, parent_ino as i64, ino as i64],
             )
             .map_err(sql_err)?;
 
-            // Store content as chunks
             if !content.is_empty() {
                 let chunk_size = self.db.chunk_size;
                 let bytes = content.as_bytes();
                 for (i, chunk_data) in bytes.chunks(chunk_size).enumerate() {
                     conn.execute(
                         "INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?1, ?2, ?3)",
-                        rusqlite::params![file_ino as i64, i as i64, chunk_data],
+                        rusqlite::params![ino as i64, i as i64, chunk_data],
                     )
                     .map_err(sql_err)?;
                 }
             }
+            ino
+        };
 
-            self.dentry_cache
-                .lock()
-                .put((parent_ino, filename.to_string()), file_ino);
-        }
+        self.dentry_cache
+            .lock()
+            .put((parent_ino, filename.to_string()), file_ino);
+        self.db.set_remote_id(file_ino, &doc.id);
+        self.db.set_mirrored_state(
+            file_ino,
+            updated_ms,
+            Some(&doc.status),
+            Some(now_ms()),
+        );
 
+        Ok(ReconcileOutcome::Created)
+    }
+
+    /// Rename an inode's dentry to a new (dir, filename), creating intermediate
+    /// directories if needed.
+    fn apply_rename_to(&self, ino: u64, new_dir: &str, new_name: &str) -> VfsResult<()> {
+        let new_parent = self.ensure_dirs(new_dir)?;
+        let conn = self.db.conn.lock();
+        let (old_parent, old_name): (i64, String) = conn
+            .query_row(
+                "SELECT parent_ino, name FROM fs_dentry WHERE ino = ?1",
+                [ino as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(sql_err)?;
+        conn.execute(
+            "UPDATE fs_dentry SET parent_ino = ?1, name = ?2 WHERE ino = ?3",
+            rusqlite::params![new_parent as i64, new_name, ino as i64],
+        )
+        .map_err(sql_err)?;
+        drop(conn);
+        let mut cache = self.dentry_cache.lock();
+        cache.pop(&(old_parent as u64, old_name));
+        cache.put((new_parent, new_name.to_string()), ino);
         Ok(())
     }
+
+    /// Rewrite a file's content by replacing all chunks with the new bytes.
+    fn rewrite_file_content(&self, ino: u64, content: &str) -> VfsResult<()> {
+        let chunk_size = self.db.chunk_size;
+        let bytes = content.as_bytes();
+        let size = bytes.len() as i64;
+        let now = Timestamp::now();
+
+        let conn = self.db.conn.lock();
+        conn.execute("DELETE FROM fs_data WHERE ino = ?1", [ino as i64])
+            .map_err(sql_err)?;
+        if !bytes.is_empty() {
+            for (i, chunk_data) in bytes.chunks(chunk_size).enumerate() {
+                conn.execute(
+                    "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![ino as i64, i as i64, chunk_data],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        conn.execute(
+            "UPDATE fs_inode SET size = ?2, mtime = ?3, mtime_nsec = ?4 WHERE ino = ?1",
+            rusqlite::params![ino as i64, size, now.sec, now.nsec as i64],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    /// Remove the local copy of a document whose remote_id disappeared
+    /// from the server. No-op if the remote_id isn't mapped or the inode is
+    /// locally dirty.
+    pub(crate) fn apply_deletion(&self, remote_id: &str) -> VfsResult<bool> {
+        let Some(ino) = self.db.ino_by_remote_id(remote_id) else {
+            return Ok(false);
+        };
+        if self.db.get_dirty_since(ino).is_some() {
+            return Ok(false);
+        }
+
+        let conn = self.db.conn.lock();
+        let parent_row: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT parent_ino, name FROM fs_dentry WHERE ino = ?1",
+                [ino as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        let (parent_ino, name) = match parent_row {
+            Some(p) => p,
+            None => return Ok(false),
+        };
+
+        conn.execute("DELETE FROM fs_dentry WHERE ino = ?1", [ino as i64])
+            .map_err(sql_err)?;
+        conn.execute("DELETE FROM fs_data WHERE ino = ?1", [ino as i64])
+            .map_err(sql_err)?;
+        conn.execute("DELETE FROM fs_inode WHERE ino = ?1", [ino as i64])
+            .map_err(sql_err)?;
+        conn.execute("DELETE FROM fs_remote WHERE ino = ?1", [ino as i64])
+            .map_err(sql_err)?;
+        drop(conn);
+        self.dentry_cache.lock().pop(&(parent_ino as u64, name));
+        Ok(true)
+    }
+
+    /// Access the `Db` handle (for sync engine).
+    pub(crate) fn db(&self) -> &Arc<Db> {
+        &self.db
+    }
+
+    /// Access the `ApiClient` handle, if one is configured.
+    pub(crate) fn api(&self) -> Option<&Arc<crate::api::ApiClient>> {
+        self.api.as_ref()
+    }
+}
+
+/// Epoch-ms parsing for ISO-8601 timestamps returned by the API.
+fn parse_iso_to_ms(iso: &str) -> Option<i64> {
+    // Minimal RFC3339 parser sufficient for API timestamps
+    // (e.g. "2026-04-18T06:55:52.356Z"). Returns epoch-ms.
+    let t = iso.find('T')?;
+    let date = &iso[..t];
+    let rest = &iso[t + 1..];
+    let (time, _tz) = rest.split_once(|c| c == 'Z' || c == '+' || c == '-')?;
+    let (y, m, d): (i64, i64, i64) = {
+        let mut it = date.split('-');
+        let y = it.next()?.parse().ok()?;
+        let m = it.next()?.parse().ok()?;
+        let d = it.next()?.parse().ok()?;
+        (y, m, d)
+    };
+    let (h, mi, s_part): (i64, i64, &str) = {
+        let mut it = time.split(':');
+        let h = it.next()?.parse().ok()?;
+        let mi = it.next()?.parse().ok()?;
+        let s = it.next()?;
+        (h, mi, s)
+    };
+    let (sec, ms) = match s_part.split_once('.') {
+        Some((s, frac)) => {
+            let sec: i64 = s.parse().ok()?;
+            let mut fracs = frac.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+            fracs.truncate(3);
+            while fracs.len() < 3 { fracs.push('0'); }
+            let ms: i64 = fracs.parse().ok()?;
+            (sec, ms)
+        }
+        None => (s_part.parse().ok()?, 0),
+    };
+    // Days since 1970-01-01 using civil-from-days algorithm (Howard Hinnant).
+    let y = y - if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let total_s = days * 86_400 + h * 3_600 + mi * 60 + sec;
+    Some(total_s * 1_000 + ms)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Outcome of reconciling one remote document against the local cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// New doc created locally.
+    Created,
+    /// Existing local inode had no remote_id; we attached this one to it
+    /// (recovers from the pre-M7 pull_documents bug).
+    Attached,
+    /// Local copy updated (content rewritten and/or renamed).
+    Updated,
+    /// Remote version matches what we already have.
+    Unchanged,
+    /// Local write is newer than this remote version; respect it.
+    SkippedDirty,
+    /// Remote doc is still being processed; wait for next poll to bring the
+    /// final version.
+    DeferredProcessing,
+    /// Doc has no usable filepath.
+    Skipped,
 }
 
 impl std::fmt::Debug for SupermemoryFs {

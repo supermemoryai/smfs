@@ -55,6 +55,18 @@ pub struct Args {
     /// already has, falling back to its built-in defaults when unset.
     #[arg(long)]
     pub memory_paths: Option<String>,
+
+    /// Delta-pull interval in seconds (default 30).
+    #[arg(long, default_value_t = 30)]
+    pub sync_interval: u64,
+
+    /// Deletion-scan interval in seconds (default 300).
+    #[arg(long, default_value_t = 300)]
+    pub deletion_scan_interval: u64,
+
+    /// Disable all background sync loops (debugging).
+    #[arg(long)]
+    pub no_sync: bool,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -153,7 +165,40 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let fs = Arc::new(SupermemoryFs::with_api(db, api));
-    let handle = mount_fs(fs, opts).await?;
+
+    // Prime the local cache with everything on the server before opening the
+    // mount. Also catches deletions that happened while we were offline.
+    if !args.no_sync {
+        match smfs_core::sync::SyncEngine::initial_pull(&fs).await {
+            Ok((removed, reconciled)) => {
+                eprintln!(
+                    "initial sync: {reconciled} docs reconciled, {removed} stale entries removed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "initial sync failed; mount will continue");
+            }
+        }
+    }
+
+    // Spawn the background sync loops. Shutdown signal flows through the
+    // watch channel when the mount is unmounting.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let sync_tasks = if args.no_sync {
+        None
+    } else {
+        let opts = smfs_core::sync::SyncOptions {
+            delta_interval: std::time::Duration::from_secs(args.sync_interval),
+            deletion_scan_interval: std::time::Duration::from_secs(args.deletion_scan_interval),
+        };
+        Some(smfs_core::sync::SyncEngine::start(
+            fs.clone(),
+            opts,
+            shutdown_rx,
+        ))
+    };
+
+    let handle = mount_fs(fs.clone(), opts).await?;
 
     // Auto-install grep wrapper on first mount.
     if let Ok(true) = super::init::ensure_grep_wrapper_installed() {
@@ -181,6 +226,21 @@ pub async fn run(args: Args) -> Result<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     eprintln!("\nunmounting...");
+
+    // Signal sync loops to exit, then wait for them to wind down (bounded).
+    let _ = shutdown_tx.send(true);
+    if let Some(mut set) = sync_tasks {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while set.join_next().await.is_some() {}
+        })
+        .await;
+    }
+
+    // Final deletion scan — catches remote deletions that happened since the
+    // last loop C tick. Best-effort.
+    if !args.no_sync {
+        smfs_core::sync::SyncEngine::unmount_scan(&fs).await;
+    }
 
     drop(handle);
     // Explicitly unmount in case the handle drop didn't (Linux FUSE).
