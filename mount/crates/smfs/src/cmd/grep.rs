@@ -28,6 +28,16 @@ pub struct Args {
 pub async fn run(args: Args) -> Result<()> {
     use super::marker::read_smfs_marker;
 
+    if args.query.trim().is_empty() {
+        eprintln!("# supermemory semantic search — provide a query");
+        eprintln!("# inside a mounted container, `grep` without flags is powered by semantic search.");
+        eprintln!("# usage:");
+        eprintln!("#   grep \"natural language query\"         search by meaning, all files");
+        eprintln!("#   grep \"query\" path/to/dir/             scope to a directory");
+        eprintln!("#   grep -F \"exact string\" path/to/file   exact match (bypasses semantic)");
+        return Ok(());
+    }
+
     let marker = read_smfs_marker();
 
     // Resolve container tag + API URL.

@@ -201,7 +201,7 @@ pub async fn run(args: Args) -> Result<()> {
     let handle = mount_fs(fs.clone(), opts).await?;
 
     // Auto-install grep wrapper on first mount.
-    if let Ok(true) = super::init::ensure_grep_wrapper_installed() {
+    if let Ok(true) = super::init::ensure_grep_wrapper_present() {
         eprintln!(
             "semantic grep enabled. run: source ~/.zshrc (new terminals have it automatically)"
         );

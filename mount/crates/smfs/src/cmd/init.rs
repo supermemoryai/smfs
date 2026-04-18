@@ -9,46 +9,64 @@ pub struct Args {}
 const SHELL_WRAPPER: &str = r#"
 # supermemoryfs grep wrapper — semantic search inside mounted containers
 grep() {
+    # Any flag → real grep; semantic doesn't know about flags.
     for arg in "$@"; do
         case "$arg" in
             -*) command grep "$@"; return ;;
         esac
     done
-    # Check if CWD or the path argument is inside a supermemory mount.
+
     _smfs_found=""
-    # First: walk up from CWD.
+
+    # Path A: CWD walk. Trigger if $PWD is actually inside a mount path.
     _smfs_dir="$PWD"
+    _smfs_pwd_real="$(pwd -P)"
     while [ "$_smfs_dir" != "/" ]; do
         if [ -f "$_smfs_dir/.smfs" ]; then
             _smfs_mp=$(command grep '^mount_path=' "$_smfs_dir/.smfs" 2>/dev/null | cut -d= -f2-)
-            # Only trigger if CWD is the mount dir or inside it.
-            case "$PWD" in "$_smfs_mp"|"$_smfs_mp"/*) _smfs_found=1 ;; esac
+            _smfs_mp_real="$(cd "$_smfs_mp" 2>/dev/null && pwd -P)"
+            case "$_smfs_pwd_real" in "$_smfs_mp_real"|"$_smfs_mp_real"/*) _smfs_found=1 ;; esac
             break
         fi
         _smfs_dir="$(dirname "$_smfs_dir")"
     done
-    # Second: if not found via CWD, check if a path argument points into a mount.
+
+    # Path B: check path args (skip the first non-flag arg — it's grep's pattern).
+    # A match only counts when the resolved path is actually inside the mount.
     if [ -z "$_smfs_found" ]; then
+        _smfs_pattern_seen=0
         for arg in "$@"; do
             case "$arg" in -*) continue ;; esac
-            # Resolve the path argument.
+            if [ "$_smfs_pattern_seen" = "0" ]; then
+                _smfs_pattern_seen=1
+                continue
+            fi
             if [ -d "$arg" ]; then
-                _smfs_dir="$arg"
-            elif [ -d "$(dirname "$arg")" ]; then
-                _smfs_dir="$(dirname "$arg")"
+                _smfs_resolved="$(cd "$arg" 2>/dev/null && pwd -P)"
+            elif [ -e "$arg" ] || [ -d "$(dirname "$arg")" ]; then
+                _smfs_parent="$(cd "$(dirname "$arg")" 2>/dev/null && pwd -P)"
+                [ -z "$_smfs_parent" ] && continue
+                _smfs_resolved="$_smfs_parent/$(basename "$arg")"
             else
                 continue
             fi
-            _smfs_dir="$(cd "$_smfs_dir" 2>/dev/null && pwd -P)" || continue
+            [ -z "$_smfs_resolved" ] && continue
+            _smfs_dir="$_smfs_resolved"
+            [ ! -d "$_smfs_dir" ] && _smfs_dir="$(dirname "$_smfs_dir")"
             while [ "$_smfs_dir" != "/" ]; do
                 if [ -f "$_smfs_dir/.smfs" ]; then
-                    _smfs_found=1
-                    break 2
+                    _smfs_mp=$(command grep '^mount_path=' "$_smfs_dir/.smfs" 2>/dev/null | cut -d= -f2-)
+                    _smfs_mp_real="$(cd "$_smfs_mp" 2>/dev/null && pwd -P)"
+                    case "$_smfs_resolved" in
+                        "$_smfs_mp_real"|"$_smfs_mp_real"/*) _smfs_found=1; break 2 ;;
+                    esac
+                    break
                 fi
                 _smfs_dir="$(dirname "$_smfs_dir")"
             done
         done
     fi
+
     if [ -n "$_smfs_found" ]; then
         smfs grep "$@"
     else
@@ -59,18 +77,32 @@ grep() {
 
 const MARKER: &str = "supermemoryfs grep wrapper";
 
-/// Install or update the grep wrapper in ~/.zshrc.
-/// Returns true if installed or updated, false if already up to date.
-pub fn ensure_grep_wrapper_installed() -> Result<bool> {
+/// Append the wrapper to ~/.zshrc if no marker is present. No-op if any
+/// wrapper block already exists — this is the cheap path used by `mount`.
+/// Returns true when a fresh install happened.
+pub fn ensure_grep_wrapper_present() -> Result<bool> {
     let home = std::env::var("HOME").map(std::path::PathBuf::from)?;
     let zshrc = home.join(".zshrc");
 
     if let Ok(content) = std::fs::read_to_string(&zshrc) {
         if content.contains(MARKER) {
-            if content.contains(SHELL_WRAPPER.trim()) {
-                return Ok(false); // already up to date
-            }
-            // Old version exists — remove it and re-add below.
+            return Ok(false);
+        }
+    }
+
+    append_wrapper(&zshrc)?;
+    Ok(true)
+}
+
+/// Strip any existing wrapper block and append a fresh copy. This is the
+/// force path used by `smfs init` — run it after upgrading the binary so
+/// the shell integration matches the current version.
+pub fn reinstall_grep_wrapper() -> Result<()> {
+    let home = std::env::var("HOME").map(std::path::PathBuf::from)?;
+    let zshrc = home.join(".zshrc");
+
+    if let Ok(content) = std::fs::read_to_string(&zshrc) {
+        if content.contains(MARKER) {
             let mut cleaned = String::new();
             let mut skip = false;
             for line in content.lines() {
@@ -91,21 +123,26 @@ pub fn ensure_grep_wrapper_installed() -> Result<bool> {
         }
     }
 
+    append_wrapper(&zshrc)?;
+    Ok(())
+}
+
+fn append_wrapper(zshrc: &std::path::Path) -> Result<()> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open(&zshrc)?;
+        .open(zshrc)?;
     file.write_all(SHELL_WRAPPER.as_bytes())?;
-
-    Ok(true)
+    Ok(())
 }
 
 pub async fn run(_args: Args) -> Result<()> {
-    if ensure_grep_wrapper_installed()? {
-        eprintln!("semantic grep installed. run: source ~/.zshrc");
-    } else {
-        eprintln!("semantic grep already installed.");
-    }
+    reinstall_grep_wrapper()?;
+    use std::io::IsTerminal;
+    let color = std::io::stderr().is_terminal();
+    let cmd = if color { "\x1b[1;36msource ~/.zshrc\x1b[0m" } else { "source ~/.zshrc" };
+    eprintln!("semantic grep (re)installed.");
+    eprintln!("run: {cmd}");
     Ok(())
 }
