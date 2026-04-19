@@ -132,6 +132,7 @@ async fn process_job(fs: &Arc<SupermemoryFs>, job: crate::cache::db::PushJob) {
                 let req = UpdateDocumentReq {
                     filepath: Some(job.filepath.clone()),
                     content: Some(text),
+                    metadata: None,
                 };
                 match api.update_document(remote_id, &req).await {
                     Ok(()) => {
@@ -235,6 +236,7 @@ async fn process_job(fs: &Arc<SupermemoryFs>, job: crate::cache::db::PushJob) {
             let req = UpdateDocumentReq {
                 filepath: Some(new_fp.clone()),
                 content: None,
+                metadata: None,
             };
             match api.update_document(&remote_id, &req).await {
                 Ok(()) => {

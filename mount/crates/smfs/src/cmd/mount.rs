@@ -152,11 +152,18 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    let api = Arc::new(smfs_core::api::ApiClient::new(
-        api_url_str,
-        &api_key,
-        &args.container_tag,
-    ));
+    // Fetch the session once at startup so we can stamp writes with the
+    // owning user id. Best-effort: if /v3/session fails (offline / bad
+    // key / server blip), we still mount — outgoing writes just carry
+    // `metadata.source` without `metadata.lastEditedBy`.
+    let session = smfs_core::api::ApiClient::validate_key(api_url_str, &api_key)
+        .await
+        .ok();
+    let mut api_client = smfs_core::api::ApiClient::new(api_url_str, &api_key, &args.container_tag);
+    if let Some(uid) = session.as_ref().and_then(|s| s.user_id.clone()) {
+        api_client = api_client.with_user_id(uid);
+    }
+    let api = Arc::new(api_client);
 
     if let Some(raw) = &args.memory_paths {
         let paths: Vec<String> = if raw.is_empty() {

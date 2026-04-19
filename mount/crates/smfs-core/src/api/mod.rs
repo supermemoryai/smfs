@@ -22,10 +22,23 @@ pub struct ApiClient {
     base_url: String,
     api_key: String,
     container_tag: String,
+    /// User ID owning the API key (from `GET /v3/session`). Stamped into
+    /// `metadata.lastEditedBy` on every mount-originated write. `None` if
+    /// session lookup failed at mount startup — writes still go through
+    /// with just `metadata.source`.
+    user_id: Option<String>,
     /// Count of write-side HTTP calls (POST/PATCH/DELETE) dispatched by this
     /// client. Used by tests to verify coalescing behavior; safe to ignore in
     /// production — it's a simple atomic counter.
     write_calls: AtomicU32,
+}
+
+/// Result of `ApiClient::validate_key`. Carries everything we extract from
+/// `/v3/session` that the mount code cares about.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub org_name: String,
+    pub user_id: Option<String>,
 }
 
 impl std::fmt::Debug for ApiClient {
@@ -49,8 +62,17 @@ impl ApiClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             container_tag: container_tag.to_string(),
+            user_id: None,
             write_calls: AtomicU32::new(0),
         }
+    }
+
+    /// Attach the user ID extracted from `/v3/session`. The mount CLI
+    /// fetches this at startup; tests may leave it unset to verify the
+    /// graceful degradation path.
+    pub fn with_user_id(mut self, user_id: String) -> Self {
+        self.user_id = Some(user_id);
+        self
     }
 
     pub fn container_tag(&self) -> &str {
@@ -66,7 +88,7 @@ impl ApiClient {
 
     /// Validate an API key by hitting GET /v3/session.
     /// This is a standalone function (no ApiClient instance needed).
-    pub async fn validate_key(base_url: &str, api_key: &str) -> Result<String, ApiError> {
+    pub async fn validate_key(base_url: &str, api_key: &str) -> Result<SessionInfo, ApiError> {
         let http = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -92,7 +114,6 @@ impl ApiClient {
             });
         }
 
-        // Extract org name from response for display.
         let body: serde_json::Value = resp.json().await.map_err(ApiError::Network)?;
         let org_name = body
             .get("org")
@@ -100,8 +121,13 @@ impl ApiClient {
             .and_then(|n| n.as_str())
             .unwrap_or("unknown")
             .to_string();
+        let user_id = body
+            .get("user")
+            .and_then(|u| u.get("id"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
-        Ok(org_name)
+        Ok(SessionInfo { org_name, user_id })
     }
 
     /// List documents, optionally filtered by filepath prefix or exact match.
@@ -157,7 +183,9 @@ impl ApiClient {
             .await
     }
 
-    /// Create a new document with content and filepath.
+    /// Create a new document with content and filepath. The request is
+    /// stamped with `metadata.source = "supermemoryfs"` (plus
+    /// `metadata.lastEditedBy` when a user id is available) for attribution.
     pub async fn create_document(
         &self,
         content: &str,
@@ -167,6 +195,7 @@ impl ApiClient {
             content: content.to_string(),
             filepath: Some(filepath.to_string()),
             container_tag: self.container_tag.clone(),
+            metadata: Some(self.mount_metadata()),
         };
 
         self.post("/v3/documents")
@@ -177,13 +206,45 @@ impl ApiClient {
             .await
     }
 
-    /// Update a document (filepath, content, or both).
+    /// Update a document (filepath, content, or both). Metadata stamping
+    /// (`source`, `lastEditedBy`) is merged into whatever the caller passed
+    /// so we never stomp caller-provided keys.
     pub async fn update_document(&self, id: &str, req: &UpdateDocumentReq) -> Result<(), ApiError> {
+        let mut stamped = req.clone();
+        let stamp = self.mount_metadata();
+        let merged = match stamped.metadata.take() {
+            Some(mut existing) => {
+                for (k, v) in stamp {
+                    existing.entry(k).or_insert(v);
+                }
+                existing
+            }
+            None => stamp,
+        };
+        stamped.metadata = Some(merged);
         self.patch(&format!("/v3/documents/{id}"))
-            .json(req)
+            .json(&stamped)
             .send_with_retry()
             .await?;
         Ok(())
+    }
+
+    /// Build the metadata object this client stamps onto every outgoing
+    /// write. `source` is always present; `lastEditedBy` is included only
+    /// when the client knows its user id (`with_user_id`).
+    fn mount_metadata(&self) -> crate::api::dto::MetadataMap {
+        let mut m = crate::api::dto::MetadataMap::new();
+        m.insert(
+            "source".into(),
+            serde_json::Value::String("supermemoryfs".into()),
+        );
+        if let Some(uid) = &self.user_id {
+            m.insert(
+                "lastEditedBy".into(),
+                serde_json::Value::String(uid.clone()),
+            );
+        }
+        m
     }
 
     pub async fn update_memory_paths(&self, paths: Vec<String>) -> Result<(), ApiError> {

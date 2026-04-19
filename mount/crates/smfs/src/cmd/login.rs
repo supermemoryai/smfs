@@ -42,8 +42,8 @@ pub async fn run(args: Args) -> Result<()> {
 
     eprint!("Validating API key... ");
     match smfs_core::api::ApiClient::validate_key(base_url, &api_key).await {
-        Ok(org_name) => {
-            eprintln!("ok (org: {org_name})");
+        Ok(session) => {
+            eprintln!("ok (org: {})", session.org_name);
         }
         Err(smfs_core::api::ApiError::Auth) => {
             bail!("Invalid API key.");
