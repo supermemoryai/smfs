@@ -17,6 +17,9 @@ dev-mnt/
 # Live integration tests (require running API + credentials)
 **/tests/*_live.rs
 
+# End-to-end verify suite — local-only dev tooling, not part of the shipped product.
+mount/verify/
+
 # Editors
 .vscode/
 .idea/
