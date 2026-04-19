@@ -12,7 +12,7 @@ use std::path::PathBuf;
 ///
 /// - Linux: `$XDG_CACHE_HOME/supermemoryfs` (usually `~/.cache/supermemoryfs`)
 /// - macOS: `~/Library/Caches/supermemoryfs`
-fn cache_dir() -> PathBuf {
+pub fn cache_dir() -> PathBuf {
     directories::ProjectDirs::from("ai", "supermemory", "supermemoryfs")
         .map(|d| d.cache_dir().to_path_buf())
         .unwrap_or_else(|| {

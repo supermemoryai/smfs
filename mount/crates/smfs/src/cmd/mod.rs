@@ -13,10 +13,13 @@ use clap::Subcommand;
 
 pub mod auth;
 pub mod daemon_inner;
+pub mod daemon_runtime;
 pub mod grep;
 pub mod init;
+pub mod list;
 pub mod login;
 pub mod logout;
+pub mod logs;
 pub mod marker;
 pub mod mount;
 pub mod status;
@@ -37,7 +40,13 @@ pub enum Command {
     Unmount(unmount::Args),
 
     /// Show status of the running daemon
-    Status,
+    Status(status::Args),
+
+    /// List all running supermemoryfs mounts
+    List,
+
+    /// Tail a running daemon's log
+    Logs(logs::Args),
 
     /// Semantic search across files in a container
     Grep(grep::Args),
@@ -49,7 +58,7 @@ pub enum Command {
     Logout(logout::Args),
 
     /// Force a sync cycle now
-    Sync,
+    Sync(sync::Args),
 
     /// Internal: long-running daemon entry point (do not invoke directly)
     #[command(hide = true)]
@@ -65,8 +74,10 @@ pub async fn dispatch(cmd: Command) -> Result<()> {
         Command::Init(args) => init::run(args).await,
         Command::Logout(args) => logout::run(args).await,
         Command::Unmount(args) => unmount::run(args).await,
-        Command::Status => status::run().await,
-        Command::Sync => sync::run().await,
+        Command::Status(args) => status::run(args).await,
+        Command::List => list::run().await,
+        Command::Logs(args) => logs::run(args).await,
+        Command::Sync(args) => sync::run(args).await,
         Command::DaemonInner(args) => daemon_inner::run(args).await,
     }
 }

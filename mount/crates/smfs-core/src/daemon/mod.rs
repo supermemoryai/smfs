@@ -1,23 +1,97 @@
-//! Daemon lifecycle and IPC.
+//! Daemon lifecycle + IPC.
 //!
-//! Manages the transition from short-lived CLI invocation to long-running
-//! background process, plus the unix-domain-socket control channel that
-//! `smfs status`, `smfs unmount`, and `smfs sync` use to talk to the running
-//! daemon.
+//! The `smfs` binary can run as either a short-lived CLI invocation (e.g.
+//! `smfs list`) or as a long-lived background daemon that owns an active
+//! mount. This module is what the daemon side uses internally — the
+//! `smfs` crate wires subcommands to [`client::send_request`] for the CLI
+//! side and spawns [`ipc::serve`] inside the daemon body.
 //!
-//! ## Planned contents (M10)
+//! ## Directory layout
 //!
-//! - `spawn::spawn_daemon` — fork via the `daemonize` crate, child re-execs
-//!   with the hidden `daemon-inner` subcommand, parent waits for a readiness
-//!   signal over a pipe before returning to the user
-//! - `lifecycle` — startup sequencing, signal handling, graceful shutdown
-//! - `ipc` — unix domain socket server/client. Protocol: JSON lines.
-//!   Requests: `Status`, `SyncNow`, `Stop`. Responses: typed status info or
-//!   error.
-//! - Socket paths:
-//!   - Linux: `$XDG_RUNTIME_DIR/smfs.sock` (fallback `/tmp/smfs-$UID.sock`)
-//!   - macOS: `<cache_dir>/smfs.sock`
-//!
-//! See `.plan/v0-plan.md` milestone M10 for the detailed spec.
+//! ```text
+//! <cache_dir>/
+//! ├── <tag>.db                  # SQLite cache (already existed pre-M9)
+//! ├── sockets/<tag>.sock        # Unix IPC socket
+//! ├── pids/<tag>.pid            # daemon pid
+//! └── logs/<tag>.log            # per-tag rolling log
+//! ```
 
-// TODO(M10): spawn, lifecycle, ipc submodules per module doc comment above.
+pub mod client;
+pub mod ipc;
+pub mod protocol;
+
+use std::path::PathBuf;
+
+use crate::config::cache_dir;
+
+pub fn sockets_dir() -> PathBuf {
+    cache_dir().join("sockets")
+}
+pub fn pids_dir() -> PathBuf {
+    cache_dir().join("pids")
+}
+pub fn logs_dir() -> PathBuf {
+    cache_dir().join("logs")
+}
+
+pub fn socket_path(tag: &str) -> PathBuf {
+    sockets_dir().join(format!("{tag}.sock"))
+}
+pub fn pid_path(tag: &str) -> PathBuf {
+    pids_dir().join(format!("{tag}.pid"))
+}
+pub fn log_path(tag: &str) -> PathBuf {
+    logs_dir().join(format!("{tag}.log"))
+}
+
+/// Create `sockets/`, `pids/`, `logs/` subdirectories if missing.
+pub fn ensure_dirs() -> std::io::Result<()> {
+    std::fs::create_dir_all(sockets_dir())?;
+    std::fs::create_dir_all(pids_dir())?;
+    std::fs::create_dir_all(logs_dir())?;
+    Ok(())
+}
+
+/// Is the given pid alive? POSIX: shells out to `kill -0 <pid>`, which
+/// does not actually send a signal — it's just a liveness probe that
+/// succeeds iff the process exists and we're permitted to signal it.
+/// Using a subprocess avoids needing `unsafe` (the crate is
+/// `#![forbid(unsafe_code)]`).
+pub fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Read the pid from a per-tag pid file, or return None.
+pub fn read_pid(tag: &str) -> Option<u32> {
+    std::fs::read_to_string(pid_path(tag))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Remove leftover socket/pid files from a previous run whose daemon
+/// isn't alive anymore. Returns true if anything was cleaned.
+pub fn cleanup_stale(tag: &str) -> bool {
+    let mut cleaned = false;
+    match read_pid(tag) {
+        Some(pid) if !pid_alive(pid) => {
+            let _ = std::fs::remove_file(pid_path(tag));
+            let _ = std::fs::remove_file(socket_path(tag));
+            cleaned = true;
+        }
+        None => {
+            if socket_path(tag).exists() {
+                let _ = std::fs::remove_file(socket_path(tag));
+                cleaned = true;
+            }
+        }
+        _ => {}
+    }
+    cleaned
+}
