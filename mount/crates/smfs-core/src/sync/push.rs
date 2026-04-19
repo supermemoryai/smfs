@@ -74,34 +74,63 @@ async fn wait_until_done(api: &crate::api::ApiClient, remote_id: &str, max_wait:
     }
 }
 
-/// Run loop D: the push worker. Drains the queue as jobs become eligible,
-/// retrying with backoff on failure.
+/// Max number of pushes we allow in flight concurrently per mount.
+/// Bounds HTTP connection count and server load while still letting
+/// independent files process in parallel.
+const PUSH_CONCURRENCY: usize = 8;
+
+/// Run loop D: the push worker. Claims queued jobs and spawns a
+/// bounded fan-out of `process_job` tasks so unrelated filepaths
+/// push concurrently. Same-file safety is guaranteed by the
+/// `inflight_started_at` atomic update inside `push_queue_claim_next`.
 pub async fn run_push_worker(fs: Arc<SupermemoryFs>, mut shutdown: watch::Receiver<bool>) {
     if fs.api().is_none() {
         return; // offline mount: nothing to push
     }
     let notify = fs.db().push_notify();
-    loop {
+    let sem = Arc::new(tokio::sync::Semaphore::new(PUSH_CONCURRENCY));
+    let mut set = tokio::task::JoinSet::new();
+
+    'outer: loop {
         tokio::select! {
             _ = shutdown.changed() => {
-                if *shutdown.borrow() { return; }
+                if *shutdown.borrow() { break 'outer; }
             }
             _ = notify.notified() => {}
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
 
-        // Drain all ready jobs in a tight loop. Between jobs we re-check
-        // shutdown cheaply but don't yield on the notify — we're already busy.
+        // Reap any finished spawns so the JoinSet doesn't grow
+        // unboundedly under a steady workload. Non-blocking.
+        while let Ok(Some(_)) =
+            tokio::time::timeout(Duration::from_millis(0), set.join_next()).await
+        {}
+
+        // Claim while permits + jobs are available. Break out when
+        // either runs dry and wait for the next wake.
         loop {
             if *shutdown.borrow() {
-                return;
+                break 'outer;
             }
-            let Some(job) = fs.db().push_queue_claim_next(now_ms()) else {
-                break;
+            let permit = match sem.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => break, // all permits held; rely on next wake
             };
-            process_job(&fs, job).await;
+            let Some(job) = fs.db().push_queue_claim_next(now_ms()) else {
+                drop(permit);
+                break; // no more eligible rows
+            };
+            let fs_clone = fs.clone();
+            set.spawn(async move {
+                let _permit = permit;
+                process_job(&fs_clone, job).await;
+            });
         }
     }
+
+    // Graceful drain on shutdown: wait for any remaining spawned tasks.
+    // daemon_runtime's drain_timeout already bounds overall unmount.
+    while set.join_next().await.is_some() {}
 }
 
 /// Max time we'll block waiting for a remote doc's async pipeline to
