@@ -32,6 +32,11 @@ use crate::cache::SupermemoryFs;
 pub struct SyncOptions {
     pub delta_interval: Duration,
     pub deletion_scan_interval: Duration,
+    /// When `false`, skip the pull-side loops (A delta pull, C deletion
+    /// scan). Push (D) and inflight status poller (E) always run because
+    /// killing them would stop delivering local writes to Supermemory —
+    /// which defeats the purpose of mounting. Default `true`.
+    pub pull_enabled: bool,
 }
 
 impl Default for SyncOptions {
@@ -39,6 +44,7 @@ impl Default for SyncOptions {
         Self {
             delta_interval: Duration::from_secs(30),
             deletion_scan_interval: Duration::from_secs(300),
+            pull_enabled: true,
         }
     }
 }
@@ -58,9 +64,17 @@ impl SyncEngine {
         Ok((removed, reconciled))
     }
 
-    /// Spawn loops A (delta pull), C (deletion scan), D (push worker), and
-    /// E (inflight status poller). Returns a JoinSet whose tasks exit when
-    /// `shutdown.send(true)` is called.
+    /// Spawn background loops for this mount. Push (D) and inflight status
+    /// poller (E) are always spawned — they are the mount's write path and
+    /// disabling them would defeat the purpose of running the mount.
+    ///
+    /// Pull-side loops — A (delta pull) and C (deletion scan) — are spawned
+    /// only when `opts.pull_enabled` is true. Setting it to false is how
+    /// `smfs mount --no-sync` stops polling for remote changes while
+    /// keeping local writes flowing to Supermemory.
+    ///
+    /// Returns a JoinSet whose tasks exit when `shutdown.send(true)` is
+    /// called.
     pub fn start(
         fs: Arc<SupermemoryFs>,
         opts: SyncOptions,
@@ -68,17 +82,19 @@ impl SyncEngine {
     ) -> JoinSet<()> {
         let mut set = JoinSet::new();
 
-        let fs_a = fs.clone();
-        let mut sd_a = shutdown.clone();
-        set.spawn(async move {
-            run_delta_loop(fs_a, opts.delta_interval, &mut sd_a).await;
-        });
+        if opts.pull_enabled {
+            let fs_a = fs.clone();
+            let mut sd_a = shutdown.clone();
+            set.spawn(async move {
+                run_delta_loop(fs_a, opts.delta_interval, &mut sd_a).await;
+            });
 
-        let fs_c = fs.clone();
-        let mut sd_c = shutdown.clone();
-        set.spawn(async move {
-            run_deletion_loop(fs_c, opts.deletion_scan_interval, &mut sd_c).await;
-        });
+            let fs_c = fs.clone();
+            let mut sd_c = shutdown.clone();
+            set.spawn(async move {
+                run_deletion_loop(fs_c, opts.deletion_scan_interval, &mut sd_c).await;
+            });
+        }
 
         let fs_d = fs.clone();
         let sd_d = shutdown.clone();

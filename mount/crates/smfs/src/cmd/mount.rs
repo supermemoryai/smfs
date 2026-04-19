@@ -64,7 +64,10 @@ pub struct Args {
     #[arg(long, default_value_t = 300)]
     pub deletion_scan_interval: u64,
 
-    /// Disable all background sync loops (debugging).
+    /// Stop polling Supermemory for remote changes. Local writes still
+    /// push to the server normally — this only disables the pull side
+    /// (delta + deletion scan), so your file edits still sync up even
+    /// when the flag is set.
     #[arg(long)]
     pub no_sync: bool,
 
@@ -194,22 +197,16 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    // Spawn the background sync loops. Shutdown signal flows through the
-    // watch channel when the mount is unmounting.
+    // Spawn the background sync loops. Push (D) and inflight poller (E)
+    // always run; `--no-sync` only turns off the pull-side loops A and C.
+    // Shutdown signal flows through the watch channel when unmounting.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let sync_tasks = if args.no_sync {
-        None
-    } else {
-        let opts = smfs_core::sync::SyncOptions {
-            delta_interval: std::time::Duration::from_secs(args.sync_interval),
-            deletion_scan_interval: std::time::Duration::from_secs(args.deletion_scan_interval),
-        };
-        Some(smfs_core::sync::SyncEngine::start(
-            fs.clone(),
-            opts,
-            shutdown_rx,
-        ))
+    let sync_opts = smfs_core::sync::SyncOptions {
+        delta_interval: std::time::Duration::from_secs(args.sync_interval),
+        deletion_scan_interval: std::time::Duration::from_secs(args.deletion_scan_interval),
+        pull_enabled: !args.no_sync,
     };
+    let sync_tasks = smfs_core::sync::SyncEngine::start(fs.clone(), sync_opts, shutdown_rx);
 
     let handle = mount_fs(fs.clone(), opts).await?;
 
@@ -241,44 +238,40 @@ pub async fn run(args: Args) -> Result<()> {
     eprintln!("\nunmounting...");
 
     // Drain the push queue BEFORE we tell the sync loops to stop. Bounded by
-    // --drain-timeout. Anything left persists in SQLite and resumes on the
-    // next mount.
-    if !args.no_sync {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(args.drain_timeout);
-        let mut last_report = 0usize;
-        loop {
-            let n = fs.push_queue_len();
-            if n == 0 {
-                if last_report > 0 {
-                    eprintln!("push queue drained");
-                }
-                break;
+    // --drain-timeout. Push-side operation — runs regardless of --no-sync,
+    // because local writes need to reach Supermemory either way.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(args.drain_timeout);
+    let mut last_report = 0usize;
+    loop {
+        let n = fs.push_queue_len();
+        if n == 0 {
+            if last_report > 0 {
+                eprintln!("push queue drained");
             }
-            if std::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    pending = n,
-                    "push queue drain timeout; rows persist and will resume next mount"
-                );
-                eprintln!("push queue drain timed out with {n} pending (will resume next mount)");
-                break;
-            }
-            if n != last_report {
-                eprintln!("draining push queue: {n} pending");
-                last_report = n;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            break;
         }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                pending = n,
+                "push queue drain timeout; rows persist and will resume next mount"
+            );
+            eprintln!("push queue drain timed out with {n} pending (will resume next mount)");
+            break;
+        }
+        if n != last_report {
+            eprintln!("draining push queue: {n} pending");
+            last_report = n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
     // Signal sync loops to exit, then wait for them to wind down (bounded).
     let _ = shutdown_tx.send(true);
-    if let Some(mut set) = sync_tasks {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while set.join_next().await.is_some() {}
-        })
-        .await;
-    }
+    let mut set = sync_tasks;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while set.join_next().await.is_some() {}
+    })
+    .await;
 
     // Final deletion scan — catches remote deletions that happened since the
     // last loop C tick. Best-effort.
