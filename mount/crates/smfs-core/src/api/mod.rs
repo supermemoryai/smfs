@@ -245,6 +245,69 @@ impl ApiClient {
             .await
     }
 
+    /// POST a binary to `/v3/documents/file` via multipart. No in-request
+    /// retry — push-queue backoff handles transient failures.
+    pub async fn create_document_multipart(
+        &self,
+        bytes: &[u8],
+        filepath: &str,
+        mime: &str,
+        filename: &str,
+    ) -> Result<CreateDocumentResp, ApiError> {
+        self.write_calls.fetch_add(1, Ordering::Relaxed);
+
+        let part = reqwest::multipart::Part::bytes(bytes.to_vec())
+            .file_name(filename.to_string())
+            .mime_str(mime)
+            .map_err(|_| ApiError::Rejected {
+                status: 415,
+                body: format!("invalid mime type '{}'", mime),
+            })?;
+
+        let metadata_json =
+            serde_json::to_string(&self.mount_metadata()).unwrap_or_else(|_| "{}".to_string());
+
+        let form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("containerTag", self.container_tag.clone())
+            .text("filepath", filepath.to_string())
+            .text("metadata", metadata_json);
+
+        let resp = self
+            .authed(self.http.post(self.url("/v3/documents/file")))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(ApiError::Network)?;
+
+        let status = resp.status();
+
+        if status.is_success() {
+            return resp
+                .json::<CreateDocumentResp>()
+                .await
+                .map_err(ApiError::Network);
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(ApiError::Auth);
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(ApiError::RateLimited);
+        }
+
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_server_error() {
+            return Err(ApiError::Server {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Err(ApiError::Rejected {
+            status: status.as_u16(),
+            body,
+        })
+    }
+
     /// Update a document (filepath, content, or both). Metadata stamping
     /// (`source`, `lastEditedBy`) is merged into whatever the caller passed
     /// so we never stomp caller-provided keys.
@@ -318,7 +381,6 @@ impl ApiClient {
             .await
     }
 
-    /// Bulk delete documents by remote id.
     pub async fn delete_documents_by_ids(&self, ids: &[&str]) -> Result<BulkDeleteResp, ApiError> {
         let body = BulkDeleteReq {
             ids: Some(ids.iter().map(|s| s.to_string()).collect()),
@@ -489,9 +551,8 @@ impl RetryableRequest {
                         });
                     }
 
-                    // Other 4xx — don't retry
                     let body = resp.text().await.unwrap_or_default();
-                    return Err(ApiError::Server {
+                    return Err(ApiError::Rejected {
                         status: status.as_u16(),
                         body,
                     });

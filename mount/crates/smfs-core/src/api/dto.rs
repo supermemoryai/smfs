@@ -26,6 +26,12 @@ pub struct Document {
     pub updated_at: String,
     #[serde(default)]
     pub metadata: Option<MetadataMap>,
+    #[serde(default, rename = "type")]
+    pub type_: Option<String>,
+    /// R2 URL for binary docs; null for plain text. Used to rehydrate raw
+    /// files on a clean remount.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 /// POST /v3/documents

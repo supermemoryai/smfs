@@ -70,6 +70,9 @@ impl Db {
             // M8: push_queue gains a remote_id column (renamed from inflight_remote_id
             // for semantic clarity — known at enqueue time for update/delete/rename).
             "ALTER TABLE push_queue ADD COLUMN remote_id TEXT",
+            "ALTER TABLE fs_inode   ADD COLUMN derived     INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE push_queue ADD COLUMN poisoned    INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE push_queue ADD COLUMN last_status INTEGER",
         ];
         for sql in migrations {
             if let Err(e) = conn.execute(sql, []) {
@@ -134,7 +137,7 @@ impl Db {
             [self.chunk_size.to_string()],
         )?;
         conn.execute(
-            "INSERT OR IGNORE INTO fs_config (key, value) VALUES ('schema_version', '1')",
+            "INSERT OR REPLACE INTO fs_config (key, value) VALUES ('schema_version', '2')",
             [],
         )?;
         Ok(())
@@ -336,6 +339,7 @@ impl Db {
                 "SELECT filepath, op, content_ino, rename_to, remote_id, attempt
                    FROM push_queue
                   WHERE inflight_started_at IS NULL
+                    AND poisoned = 0
                     AND updated_at <= ?1
                   ORDER BY updated_at ASC
                   LIMIT 1",
@@ -447,6 +451,47 @@ impl Db {
     pub(crate) fn push_queue_drop(&self, filepath: &str) {
         let conn = self.conn.lock();
         let _ = conn.execute("DELETE FROM push_queue WHERE filepath = ?1", [filepath]);
+    }
+
+    pub(crate) fn push_queue_poison(
+        &self,
+        filepath: &str,
+        http_status: u16,
+        reason: &str,
+        now_ms: i64,
+    ) {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "UPDATE push_queue
+                SET poisoned            = 1,
+                    inflight_started_at = NULL,
+                    last_error          = ?2,
+                    last_status         = ?3,
+                    updated_at          = ?4
+              WHERE filepath = ?1",
+            rusqlite::params![filepath, reason, http_status as i64, now_ms],
+        );
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_derived(&self, ino: u64, derived: bool) {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "UPDATE fs_inode SET derived = ?2 WHERE ino = ?1",
+            rusqlite::params![ino as i64, derived as i64],
+        );
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_derived(&self, ino: u64) -> bool {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT derived FROM fs_inode WHERE ino = ?1",
+            [ino as i64],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|v| v != 0)
+        .unwrap_or(false)
     }
 
     /// On 404 from the server: clear the pushed remote_id from both
@@ -561,6 +606,7 @@ pub(crate) enum PushOp {
     Update,
     Delete,
     Rename,
+    UploadBinary,
 }
 
 impl PushOp {
@@ -570,6 +616,7 @@ impl PushOp {
             PushOp::Update => "update",
             PushOp::Delete => "delete",
             PushOp::Rename => "rename",
+            PushOp::UploadBinary => "upload_binary",
         }
     }
 
@@ -579,6 +626,7 @@ impl PushOp {
             "update" => Some(PushOp::Update),
             "delete" => Some(PushOp::Delete),
             "rename" => Some(PushOp::Rename),
+            "upload_binary" => Some(PushOp::UploadBinary),
             _ => None,
         }
     }

@@ -7,6 +7,9 @@ use async_trait::async_trait;
 use super::db::{Db, PushOp};
 use crate::vfs::{FileAttr, Timestamp, VfsError, VfsResult};
 
+/// Per-file cap. Matches the Cloudflare Workers paid-tier request limit.
+pub(crate) const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -113,6 +116,14 @@ impl crate::vfs::File for SqliteFile {
     async fn write(&self, offset: u64, data: &[u8]) -> VfsResult<u32> {
         if data.is_empty() {
             return Ok(0);
+        }
+
+        let prospective_end = offset.saturating_add(data.len() as u64);
+        if prospective_end > MAX_FILE_SIZE {
+            return Err(VfsError::InvalidPath(format!(
+                "file exceeds {} MB cap",
+                MAX_FILE_SIZE / (1024 * 1024)
+            )));
         }
 
         let conn = self.db.conn.lock();

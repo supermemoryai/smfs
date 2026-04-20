@@ -138,6 +138,20 @@ pub async fn run_push_worker(fs: Arc<SupermemoryFs>, mut shutdown: watch::Receiv
 /// localhost (typical 2-4s) and still bounded enough for production.
 const WAIT_DONE_MAX: Duration = Duration::from_secs(30);
 
+fn poison_with_sibling(fs: &Arc<SupermemoryFs>, filepath: &str, status: u16, body: &str) {
+    fs.db().push_queue_poison(filepath, status, body, now_ms());
+    let reason = format!(
+        "smfs: server rejected this file (HTTP {}).\n\nreason: {}\n\nTo retry, delete this error file and re-copy the source.\n",
+        status, body
+    );
+    let sibling = format!("{}.smfs-error.txt", filepath);
+    if let Err(e) = fs.create_derived_sibling(&sibling, &reason) {
+        tracing::warn!(filepath, sibling, error = %e, "push: failed to write error sibling");
+    } else {
+        tracing::warn!(filepath, status, "push: poisoned; error sibling written");
+    }
+}
+
 async fn process_job(fs: &Arc<SupermemoryFs>, job: crate::cache::db::PushJob) {
     let api = fs.api().expect("push worker requires api");
     let db = fs.db();
@@ -150,7 +164,16 @@ async fn process_job(fs: &Arc<SupermemoryFs>, job: crate::cache::db::PushJob) {
                 return;
             };
             let content = db.read_all_content(ino);
-            let text = String::from_utf8_lossy(&content).into_owned();
+
+            // Non-UTF-8 → route through multipart; JSON content column
+            // rejects null bytes.
+            if std::str::from_utf8(&content).is_err() {
+                process_binary_upload(fs, api, db.clone(), &job, ino, &content).await;
+                return;
+            }
+            let text = std::str::from_utf8(&content)
+                .expect("validated above")
+                .to_string();
 
             if let Some(remote_id) = job.remote_id.as_deref() {
                 // Before a PATCH, ensure the doc has finished any prior
@@ -185,6 +208,9 @@ async fn process_job(fs: &Arc<SupermemoryFs>, job: crate::cache::db::PushJob) {
                         );
                         db.push_notify().notify_one();
                     }
+                    Err(ApiError::Rejected { status, body }) => {
+                        poison_with_sibling(fs, &job.filepath, status, &body);
+                    }
                     Err(e) => {
                         let bo = backoff_ms(job.attempt);
                         tracing::warn!(filepath = %job.filepath, attempt = job.attempt, backoff_ms = bo, error = %e, "push: PATCH failed");
@@ -205,6 +231,9 @@ async fn process_job(fs: &Arc<SupermemoryFs>, job: crate::cache::db::PushJob) {
                         db.push_queue_finalize_success(&job.filepath, now_ms());
                         db.push_notify().notify_one();
                     }
+                    Err(ApiError::Rejected { status, body }) => {
+                        poison_with_sibling(fs, &job.filepath, status, &body);
+                    }
                     Err(e) => {
                         let bo = backoff_ms(job.attempt);
                         tracing::warn!(filepath = %job.filepath, attempt = job.attempt, backoff_ms = bo, error = %e, "push: POST failed");
@@ -212,6 +241,16 @@ async fn process_job(fs: &Arc<SupermemoryFs>, job: crate::cache::db::PushJob) {
                     }
                 }
             }
+        }
+
+        PushOp::UploadBinary => {
+            let Some(ino) = job.content_ino else {
+                tracing::warn!(filepath = %job.filepath, "push: upload_binary without content_ino; dropping row");
+                db.push_queue_drop(&job.filepath);
+                return;
+            };
+            let content = db.read_all_content(ino);
+            process_binary_upload(fs, api, db.clone(), &job, ino, &content).await;
         }
 
         PushOp::Delete => {
@@ -224,6 +263,10 @@ async fn process_job(fs: &Arc<SupermemoryFs>, job: crate::cache::db::PushJob) {
                     tracing::debug!(filepath = %job.filepath, remote_id = ?job.remote_id, deleted = r.deleted_count, "push: DELETE ok");
                     db.push_queue_finalize_success(&job.filepath, now_ms());
                     db.push_notify().notify_one();
+                }
+                Err(ApiError::Rejected { status, body }) => {
+                    db.push_queue_poison(&job.filepath, status, &body, now_ms());
+                    tracing::warn!(filepath = %job.filepath, status, "push: DELETE poisoned");
                 }
                 Err(e) => {
                     let bo = backoff_ms(job.attempt);
@@ -280,6 +323,10 @@ async fn process_job(fs: &Arc<SupermemoryFs>, job: crate::cache::db::PushJob) {
                     db.push_queue_finalize_success(&job.filepath, now_ms());
                     db.push_notify().notify_one();
                 }
+                Err(ApiError::Rejected { status, body }) => {
+                    db.push_queue_poison(&job.filepath, status, &body, now_ms());
+                    tracing::warn!(filepath = %job.filepath, status, "push: rename poisoned");
+                }
                 Err(e) => {
                     let bo = backoff_ms(job.attempt);
                     tracing::warn!(old = %job.filepath, attempt = job.attempt, backoff_ms = bo, error = %e, "push: rename failed");
@@ -288,6 +335,92 @@ async fn process_job(fs: &Arc<SupermemoryFs>, job: crate::cache::db::PushJob) {
             }
         }
     }
+}
+
+async fn process_binary_upload(
+    fs: &Arc<SupermemoryFs>,
+    api: &crate::api::ApiClient,
+    db: std::sync::Arc<crate::cache::db::Db>,
+    job: &crate::cache::db::PushJob,
+    ino: u64,
+    content: &[u8],
+) {
+    let filename = job
+        .filepath
+        .rsplit('/')
+        .next()
+        .unwrap_or("file")
+        .to_string();
+    let mime = guess_mime(&filename);
+
+    match api
+        .create_document_multipart(content, &job.filepath, &mime, &filename)
+        .await
+    {
+        Ok(resp) => {
+            tracing::debug!(
+                filepath = %job.filepath,
+                remote_id = %resp.id,
+                mime,
+                size = content.len(),
+                "push: multipart upload ok"
+            );
+            db.set_remote_id(ino, &resp.id);
+            db.push_queue_set_remote_id(&job.filepath, &resp.id);
+            wait_until_done(api, &resp.id, WAIT_DONE_MAX).await;
+            db.set_mirrored_state(ino, None, Some("done"), Some(now_ms()));
+            db.set_dirty_since(ino, None);
+            db.push_queue_finalize_success(&job.filepath, now_ms());
+            db.push_notify().notify_one();
+        }
+        Err(ApiError::Rejected { status, body }) => {
+            poison_with_sibling(fs, &job.filepath, status, &body);
+        }
+        Err(e) => {
+            let bo = backoff_ms(job.attempt);
+            tracing::warn!(filepath = %job.filepath, attempt = job.attempt, backoff_ms = bo, error = %e, "push: multipart upload failed");
+            db.push_queue_finalize_failure(&job.filepath, &e.to_string(), now_ms(), bo);
+        }
+    }
+}
+
+fn guess_mime(filename: &str) -> String {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "pdf" => "application/pdf",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "ogg" => "audio/ogg",
+        "aiff" | "aif" => "audio/aiff",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "xml" => "application/xml",
+        "json" => "application/json",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 /// Stuck-detection tier based on how long the row has been awaiting `done`.

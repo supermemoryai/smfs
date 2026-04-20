@@ -8,10 +8,13 @@
 use std::sync::Arc;
 
 use crate::api::{ApiClient, Document, ListDocumentsReq, ListDocumentsResp};
+use crate::cache::ReconcileOutcome;
 use crate::cache::SupermemoryFs;
 
 const PAGE_SIZE: u32 = 100;
 const SYNC_META_LAST_SEEN: &str = "last_seen_updated_at";
+/// Per-file cap on R2 rehydration fetch (larger files stay 0-byte stubs).
+const REHYDRATE_SIZE_CAP: u64 = 20 * 1024 * 1024;
 
 /// Run one pass of the delta pull loop. Returns the number of remote docs
 /// that were reconciled this pass (whether or not they produced local
@@ -42,7 +45,10 @@ pub async fn delta_pull(fs: &Arc<SupermemoryFs>) -> anyhow::Result<usize> {
                 hit_watermark = true;
                 break;
             }
-            let _ = fs.reconcile_one(doc);
+            let outcome = fs.reconcile_one(doc);
+            if matches!(outcome, Ok(ReconcileOutcome::NeedsRehydrate)) {
+                rehydrate_if_possible(fs, doc).await;
+            }
             reconciled += 1;
             if doc.updated_at > newest_seen {
                 newest_seen = doc.updated_at.clone();
@@ -96,7 +102,10 @@ pub async fn full_pull(fs: &Arc<SupermemoryFs>) -> anyhow::Result<usize> {
             break;
         }
         for doc in &resp.memories {
-            let _ = fs.reconcile_one(doc);
+            let outcome = fs.reconcile_one(doc);
+            if matches!(outcome, Ok(ReconcileOutcome::NeedsRehydrate)) {
+                rehydrate_if_possible(fs, doc).await;
+            }
             reconciled += 1;
             if doc.updated_at > newest_seen {
                 newest_seen = doc.updated_at.clone();
@@ -115,6 +124,57 @@ pub async fn full_pull(fs: &Arc<SupermemoryFs>) -> anyhow::Result<usize> {
     Ok(reconciled)
 }
 
-/// Silence unused-Document warning while we iterate on this module.
-#[allow(dead_code)]
-fn _noop(_d: &Document) {}
+async fn rehydrate_if_possible(fs: &Arc<SupermemoryFs>, doc: &Document) {
+    let Some(url) = doc.url.as_deref() else {
+        return;
+    };
+    let Some(ino) = fs.ino_for_remote_id(&doc.id) else {
+        tracing::warn!(doc_id = %doc.id, "rehydrate: stub inode not found");
+        return;
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "rehydrate: http client build failed");
+            return;
+        }
+    };
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(url, error = %e, "rehydrate: GET failed");
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(url, status = %resp.status(), "rehydrate: GET non-2xx");
+        return;
+    }
+    if let Some(len) = resp.content_length() {
+        if len > REHYDRATE_SIZE_CAP {
+            tracing::info!(
+                url,
+                size = len,
+                cap = REHYDRATE_SIZE_CAP,
+                "rehydrate: skipping oversized file; stub remains 0 bytes"
+            );
+            return;
+        }
+    }
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(url, error = %e, "rehydrate: body read failed");
+            return;
+        }
+    };
+    if let Err(e) = fs.rehydrate_raw_bytes(ino, &bytes) {
+        tracing::warn!(url, error = %e, "rehydrate: local write failed");
+        return;
+    }
+    tracing::info!(url, bytes = bytes.len(), "rehydrated raw file");
+}

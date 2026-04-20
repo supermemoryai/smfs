@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS fs_inode (
     atime_nsec   INTEGER NOT NULL DEFAULT 0,
     mtime_nsec   INTEGER NOT NULL DEFAULT 0,
     ctime_nsec   INTEGER NOT NULL DEFAULT 0,
-    dirty_since  INTEGER
+    dirty_since  INTEGER,
+    derived      INTEGER NOT NULL DEFAULT 0
 );
 
 -- Directory entries: maps (parent_ino, name) → child ino.
@@ -81,7 +82,9 @@ CREATE TABLE IF NOT EXISTS push_queue (
     pending_rename_to    TEXT,
     last_error           TEXT,
     attempt              INTEGER NOT NULL DEFAULT 0,
-    updated_at           INTEGER NOT NULL
+    updated_at           INTEGER NOT NULL,
+    poisoned             INTEGER NOT NULL DEFAULT 0,
+    last_status          INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_push_queue_updated ON push_queue(updated_at);
 

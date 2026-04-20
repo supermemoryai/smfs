@@ -10,6 +10,15 @@ use parking_lot::Mutex;
 use super::db::{Db, DENTRY_CACHE_MAX, ROOT_INO};
 use super::file::SqliteFile;
 use super::profile::{ProfileFile, PROFILE_INO, PROFILE_NAME};
+
+const DERIVED_SIBLING_SUFFIXES: &[&str] = &[
+    ".image-transcription.md",
+    ".pdf-transcription.md",
+    ".video-transcription.md",
+    ".audio-transcription.md",
+    ".webpage-transcription.md",
+    ".smfs-error.txt",
+];
 use crate::vfs::error::{VfsError, VfsResult};
 use crate::vfs::mode::{MAX_NAME_LEN, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 use crate::vfs::traits::File as _; // bring truncate() into scope
@@ -223,6 +232,12 @@ impl SupermemoryFs {
         let filename = &filepath[pos + 1..];
 
         let updated_ms = parse_iso_to_ms(&doc.updated_at);
+        // For binary types, `doc.content` holds extracted text, not the raw
+        // file — never overwrite the local raw inode with it.
+        let is_binary_type = matches!(
+            doc.type_.as_deref(),
+            Some("image") | Some("pdf") | Some("video") | Some("audio") | Some("webpage")
+        );
 
         // If an inode is already mapped to this remote_id, update it in place.
         if let Some(existing_ino) = self.db.ino_by_remote_id(&doc.id) {
@@ -242,6 +257,8 @@ impl SupermemoryFs {
                 .and_then(|(u, _, _)| u);
             if let (Some(m), Some(u)) = (mirrored, updated_ms) {
                 if m >= u && doc.status == "done" {
+                    self.sync_transcription_sibling(doc, filepath);
+                    self.sync_error_sibling(doc, filepath);
                     return Ok(ReconcileOutcome::Unchanged);
                 }
             }
@@ -260,8 +277,10 @@ impl SupermemoryFs {
             // `updatedAt` while the local content still reflects an earlier
             // version, and the next poll would skip re-reconciliation.
             if doc.status == "done" {
-                if let Some(content) = doc.content.as_deref() {
-                    self.rewrite_file_content(existing_ino, content)?;
+                if !is_binary_type {
+                    if let Some(content) = doc.content.as_deref() {
+                        self.rewrite_file_content(existing_ino, content)?;
+                    }
                 }
                 self.db.set_mirrored_state(
                     existing_ino,
@@ -269,19 +288,21 @@ impl SupermemoryFs {
                     Some(&doc.status),
                     Some(now_ms()),
                 );
+                self.sync_transcription_sibling(doc, filepath);
             } else {
-                // In-progress: track status for observability but leave
-                // `mirrored_updated_at` alone so we keep re-polling until done.
                 self.db
                     .set_mirrored_state(existing_ino, None, Some(&doc.status), Some(now_ms()));
+                self.sync_error_sibling(doc, filepath);
             }
             return Ok(ReconcileOutcome::Updated);
         }
 
         // New doc (not yet mirrored locally) — create inode+dentry+chunks.
-        // Skip in-progress docs so we don't materialize partial content; the
-        // next poll after the doc reaches "done" will pick it up.
+        // Skip in-progress docs so we don't materialize partial content.
         if doc.status != "done" {
+            if doc.status == "failed" {
+                self.sync_error_sibling(doc, filepath);
+            }
             return Ok(ReconcileOutcome::DeferredProcessing);
         }
 
@@ -302,13 +323,29 @@ impl SupermemoryFs {
             let ino = ino_i64 as u64;
             self.db.set_remote_id(ino, &doc.id);
             if doc.status == "done" {
-                if let Some(content) = doc.content.as_deref() {
-                    self.rewrite_file_content(ino, content)?;
+                if !is_binary_type {
+                    if let Some(content) = doc.content.as_deref() {
+                        self.rewrite_file_content(ino, content)?;
+                    }
                 }
+                self.sync_transcription_sibling(doc, filepath);
             }
             self.db
                 .set_mirrored_state(ino, updated_ms, Some(&doc.status), Some(now_ms()));
             return Ok(ReconcileOutcome::Attached);
+        }
+
+        if is_binary_type {
+            self.sync_transcription_sibling(doc, filepath);
+            self.sync_error_sibling(doc, filepath);
+            if doc.url.is_some() {
+                let ino = self.create_raw_stub(filepath, &doc.id)?;
+                self.db.set_remote_id(ino, &doc.id);
+                self.db
+                    .set_mirrored_state(ino, updated_ms, Some(&doc.status), Some(now_ms()));
+                return Ok(ReconcileOutcome::NeedsRehydrate);
+            }
+            return Ok(ReconcileOutcome::DeferredProcessing);
         }
 
         let content = doc.content.as_deref().unwrap_or("");
@@ -356,8 +393,139 @@ impl SupermemoryFs {
         self.db.set_remote_id(file_ino, &doc.id);
         self.db
             .set_mirrored_state(file_ino, updated_ms, Some(&doc.status), Some(now_ms()));
+        self.sync_transcription_sibling(doc, filepath);
 
         Ok(ReconcileOutcome::Created)
+    }
+
+    fn remove_derived_sibling(&self, parent_ino: u64, name: &str) {
+        let conn = self.db.conn.lock();
+        let row: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT d.ino, i.derived
+                   FROM fs_dentry d JOIN fs_inode i ON i.ino = d.ino
+                  WHERE d.parent_ino = ?1 AND d.name = ?2",
+                rusqlite::params![parent_ino as i64, name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        let Some((ino, derived)) = row else {
+            return;
+        };
+        if derived == 0 {
+            return;
+        }
+        let _ = conn.execute(
+            "DELETE FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
+            rusqlite::params![parent_ino as i64, name],
+        );
+        let _ = conn.execute("DELETE FROM fs_data WHERE ino = ?1", [ino]);
+        let _ = conn.execute("DELETE FROM fs_inode WHERE ino = ?1", [ino]);
+        drop(conn);
+        self.dentry_cache
+            .lock()
+            .pop(&(parent_ino, name.to_string()));
+    }
+
+    fn cascade_unlink_derived_siblings(&self, parent_ino: u64, name: &str) {
+        for suffix in DERIVED_SIBLING_SUFFIXES {
+            let sibling_name = format!("{}{}", name, suffix);
+            self.remove_derived_sibling(parent_ino, &sibling_name);
+        }
+    }
+
+    fn rename_derived_sibling(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+    ) {
+        let conn = self.db.conn.lock();
+        let row: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT d.ino, i.derived
+                   FROM fs_dentry d JOIN fs_inode i ON i.ino = d.ino
+                  WHERE d.parent_ino = ?1 AND d.name = ?2",
+                rusqlite::params![old_parent as i64, old_name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        let Some((ino, derived)) = row else {
+            return;
+        };
+        if derived == 0 {
+            return;
+        }
+        let _ = conn.execute(
+            "DELETE FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
+            rusqlite::params![new_parent as i64, new_name],
+        );
+        let _ = conn.execute(
+            "UPDATE fs_dentry SET parent_ino = ?1, name = ?2 WHERE ino = ?3",
+            rusqlite::params![new_parent as i64, new_name, ino],
+        );
+        drop(conn);
+        let mut cache = self.dentry_cache.lock();
+        cache.pop(&(old_parent, old_name.to_string()));
+        cache.put((new_parent, new_name.to_string()), ino as u64);
+    }
+
+    fn cascade_rename_derived_siblings(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+    ) {
+        for suffix in DERIVED_SIBLING_SUFFIXES {
+            let old = format!("{}{}", old_name, suffix);
+            let new = format!("{}{}", new_name, suffix);
+            self.rename_derived_sibling(old_parent, &old, new_parent, &new);
+        }
+    }
+
+    /// If the doc is a non-text type that has extracted content, materialize
+    /// a read-only `.<type>-transcription.md` sibling next to the raw file.
+    fn sync_error_sibling(&self, doc: &crate::api::Document, filepath: &str) {
+        if doc.status != "failed" {
+            return;
+        }
+        let reason = format!(
+            "smfs: server-side extraction failed for this file.\n\n\
+             type: {}\n\
+             doc id: {}\n\n\
+             The file is stored on the server but could not be processed.\n\
+             To retry, delete this error file and re-copy the source.\n",
+            doc.type_.as_deref().unwrap_or("<unknown>"),
+            doc.id
+        );
+        let sibling = format!("{}.smfs-error.txt", filepath);
+        if let Err(e) = self.create_derived_sibling(&sibling, &reason) {
+            tracing::warn!(filepath, sibling, error = %e, "error sibling creation failed");
+        }
+    }
+
+    fn sync_transcription_sibling(&self, doc: &crate::api::Document, filepath: &str) {
+        if doc.status != "done" {
+            return;
+        }
+        let content = match doc.content.as_deref() {
+            Some(c) if !c.is_empty() => c,
+            _ => return,
+        };
+        let suffix = match doc.type_.as_deref() {
+            Some("image") => ".image-transcription.md",
+            Some("pdf") => ".pdf-transcription.md",
+            Some("video") => ".video-transcription.md",
+            Some("audio") => ".audio-transcription.md",
+            Some("webpage") => ".webpage-transcription.md",
+            _ => return,
+        };
+        let sibling_path = format!("{}{}", filepath, suffix);
+        if let Err(e) = self.create_derived_sibling(&sibling_path, content) {
+            tracing::warn!(filepath, sibling = %sibling_path, error = %e, "transcription sibling creation failed");
+        }
     }
 
     /// Rename an inode's dentry to a new (dir, filename), creating intermediate
@@ -409,6 +577,161 @@ impl SupermemoryFs {
         )
         .map_err(sql_err)?;
         Ok(())
+    }
+
+    pub(crate) fn create_derived_sibling(&self, filepath: &str, content: &str) -> VfsResult<u64> {
+        let (dir, filename) = match filepath.rfind('/') {
+            Some(pos) => {
+                let d = if pos == 0 { "/" } else { &filepath[..pos] };
+                (d.to_string(), filepath[pos + 1..].to_string())
+            }
+            None => return Err(VfsError::InvalidPath("derived sibling needs path".into())),
+        };
+        if filename.is_empty() {
+            return Err(VfsError::InvalidPath(
+                "derived sibling needs filename".into(),
+            ));
+        }
+        let parent_ino = self.ensure_dirs(&dir)?;
+        let bytes = content.as_bytes();
+        let size = bytes.len() as i64;
+        let chunk_size = self.db.chunk_size;
+        let now = Timestamp::now();
+
+        let conn = self.db.conn.lock();
+        let existing: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT d.ino, i.derived
+                   FROM fs_dentry d JOIN fs_inode i ON i.ino = d.ino
+                  WHERE d.parent_ino = ?1 AND d.name = ?2",
+                rusqlite::params![parent_ino as i64, filename],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+
+        let ino = if let Some((existing_ino, derived)) = existing {
+            if derived == 0 {
+                return Err(VfsError::AlreadyExists);
+            }
+            conn.execute("DELETE FROM fs_data WHERE ino = ?1", [existing_ino])
+                .map_err(sql_err)?;
+            for (i, chunk_data) in bytes.chunks(chunk_size).enumerate() {
+                conn.execute(
+                    "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![existing_ino, i as i64, chunk_data],
+                )
+                .map_err(sql_err)?;
+            }
+            conn.execute(
+                "UPDATE fs_inode SET size = ?2, mtime = ?3, mtime_nsec = ?4 WHERE ino = ?1",
+                rusqlite::params![existing_ino, size, now.sec, now.nsec as i64],
+            )
+            .map_err(sql_err)?;
+            existing_ino as u64
+        } else {
+            conn.execute(
+                "INSERT INTO fs_inode (mode, nlink, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec, derived)
+                 VALUES (?1, 1, 0, 0, ?2, ?3, ?3, ?3, 0, ?4, ?4, ?4, 1)",
+                rusqlite::params![
+                    (S_IFREG | 0o444) as i64,
+                    size,
+                    now.sec,
+                    now.nsec as i64,
+                ],
+            )
+            .map_err(sql_err)?;
+            let new_ino = conn.last_insert_rowid() as u64;
+            conn.execute(
+                "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?1, ?2, ?3)",
+                rusqlite::params![filename, parent_ino as i64, new_ino as i64],
+            )
+            .map_err(sql_err)?;
+            for (i, chunk_data) in bytes.chunks(chunk_size).enumerate() {
+                conn.execute(
+                    "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![new_ino as i64, i as i64, chunk_data],
+                )
+                .map_err(sql_err)?;
+            }
+            new_ino
+        };
+        drop(conn);
+
+        self.dentry_cache.lock().put((parent_ino, filename), ino);
+        Ok(ino)
+    }
+
+    pub(crate) fn create_raw_stub(&self, filepath: &str, _remote_id: &str) -> VfsResult<u64> {
+        let (dir, filename) = match filepath.rfind('/') {
+            Some(pos) => {
+                let d = if pos == 0 { "/" } else { &filepath[..pos] };
+                (d.to_string(), filepath[pos + 1..].to_string())
+            }
+            None => return Err(VfsError::InvalidPath("stub needs slashed path".into())),
+        };
+        if filename.is_empty() {
+            return Err(VfsError::InvalidPath("stub needs filename".into()));
+        }
+        let parent_ino = self.ensure_dirs(&dir)?;
+        let now = Timestamp::now();
+
+        let conn = self.db.conn.lock();
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT ino FROM fs_dentry WHERE parent_ino = ?1 AND name = ?2",
+                rusqlite::params![parent_ino as i64, filename],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(ino) = existing {
+            return Ok(ino as u64);
+        }
+        conn.execute(
+            "INSERT INTO fs_inode (mode, nlink, uid, gid, size, atime, mtime, ctime, rdev, atime_nsec, mtime_nsec, ctime_nsec)
+             VALUES (?1, 1, 0, 0, 0, ?2, ?2, ?2, 0, ?3, ?3, ?3)",
+            rusqlite::params![
+                (S_IFREG | 0o644) as i64,
+                now.sec,
+                now.nsec as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        let ino = conn.last_insert_rowid() as u64;
+        conn.execute(
+            "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?1, ?2, ?3)",
+            rusqlite::params![filename, parent_ino as i64, ino as i64],
+        )
+        .map_err(sql_err)?;
+        drop(conn);
+        self.dentry_cache.lock().put((parent_ino, filename), ino);
+        Ok(ino)
+    }
+
+    pub fn rehydrate_raw_bytes(&self, ino: u64, bytes: &[u8]) -> VfsResult<()> {
+        let chunk_size = self.db.chunk_size;
+        let size = bytes.len() as i64;
+        let now = Timestamp::now();
+
+        let conn = self.db.conn.lock();
+        conn.execute("DELETE FROM fs_data WHERE ino = ?1", [ino as i64])
+            .map_err(sql_err)?;
+        for (i, chunk_data) in bytes.chunks(chunk_size).enumerate() {
+            conn.execute(
+                "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?1, ?2, ?3)",
+                rusqlite::params![ino as i64, i as i64, chunk_data],
+            )
+            .map_err(sql_err)?;
+        }
+        conn.execute(
+            "UPDATE fs_inode SET size = ?2, mtime = ?3, mtime_nsec = ?4 WHERE ino = ?1",
+            rusqlite::params![ino as i64, size, now.sec, now.nsec as i64],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    pub fn ino_for_remote_id(&self, remote_id: &str) -> Option<u64> {
+        self.db.ino_by_remote_id(remote_id)
     }
 
     /// Remove the local copy of a document whose remote_id disappeared
@@ -578,6 +901,9 @@ pub enum ReconcileOutcome {
     /// Remote doc is still being processed; wait for next poll to bring the
     /// final version.
     DeferredProcessing,
+    /// Pure-pull of a binary doc: we created a 0-byte stub inode; caller
+    /// should fetch `doc.url` and populate chunks.
+    NeedsRehydrate,
 }
 
 impl std::fmt::Debug for SupermemoryFs {
@@ -1255,6 +1581,8 @@ impl FileSystem for SupermemoryFs {
             }
         }
 
+        self.cascade_unlink_derived_siblings(parent_ino, name);
+
         Ok(())
     }
 
@@ -1638,6 +1966,8 @@ impl FileSystem for SupermemoryFs {
                 tracing::debug!(old = %old_fp, new = %new_fp, "enqueued push (rename)");
             }
         }
+
+        self.cascade_rename_derived_siblings(old_parent_ino, old_name, new_parent_ino, new_name);
 
         Ok(())
     }

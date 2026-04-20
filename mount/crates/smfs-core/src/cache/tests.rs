@@ -474,3 +474,198 @@ async fn test_statfs_counts_inodes_and_bytes() {
     assert!(stats.inodes >= 2);
     assert_eq!(stats.bytes_used, 5);
 }
+
+// ─── Binary upload + sibling transcripts + poison-job ───────────────
+
+use crate::api::Document;
+use crate::cache::db::PushOp;
+
+fn doc_with(id: &str, filepath: &str, type_: &str, content: &str, status: &str) -> Document {
+    Document {
+        id: id.to_string(),
+        filepath: Some(filepath.to_string()),
+        custom_id: None,
+        title: None,
+        summary: None,
+        content: Some(content.to_string()),
+        status: status.to_string(),
+        container_tags: None,
+        created_at: "2026-01-01T00:00:00.000Z".to_string(),
+        updated_at: "2026-01-01T00:00:00.000Z".to_string(),
+        metadata: None,
+        type_: Some(type_.to_string()),
+        url: None,
+    }
+}
+
+#[tokio::test]
+async fn test_reconcile_image_synthesizes_transcription_sibling() {
+    let fs = fs();
+    let doc = doc_with("d1", "/cat.png", "image", "a cat on a couch", "done");
+    fs.reconcile_one(&doc).unwrap();
+    let attr = fs
+        .lookup(ROOT, "cat.png.image-transcription.md")
+        .await
+        .unwrap()
+        .expect("transcription sibling must exist");
+    assert_eq!(attr.mode & 0o777, 0o444);
+    assert!(fs.db().is_derived(attr.ino));
+    assert_eq!(attr.size as usize, "a cat on a couch".len());
+}
+
+#[tokio::test]
+async fn test_reconcile_pdf_synthesizes_pdf_transcription_sibling() {
+    let fs = fs();
+    let doc = doc_with("d2", "/notes.pdf", "pdf", "extracted page text", "done");
+    fs.reconcile_one(&doc).unwrap();
+    assert!(fs
+        .lookup(ROOT, "notes.pdf.pdf-transcription.md")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn test_reconcile_text_creates_no_sibling() {
+    let fs = fs();
+    let doc = doc_with("d3", "/plain.md", "text", "hello", "done");
+    fs.reconcile_one(&doc).unwrap();
+    // No sibling suffixed file should exist.
+    for suffix in &[
+        ".image-transcription.md",
+        ".pdf-transcription.md",
+        ".video-transcription.md",
+        ".audio-transcription.md",
+        ".webpage-transcription.md",
+    ] {
+        let name = format!("plain.md{}", suffix);
+        assert!(
+            fs.lookup(ROOT, &name).await.unwrap().is_none(),
+            "unexpected sibling {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_derived_inode_never_enters_push_queue() {
+    let fs = fs();
+    let doc = doc_with("d4", "/cat.png", "image", "description", "done");
+    fs.reconcile_one(&doc).unwrap();
+    let sibling = fs
+        .lookup(ROOT, "cat.png.image-transcription.md")
+        .await
+        .unwrap()
+        .unwrap();
+    // Even if we were to mark it dirty, claim_next should not see it because
+    // we never enqueue derived inodes; verify by checking push_queue is empty.
+    fs.db().set_dirty_since(sibling.ino, Some(1));
+    let now = 10_000_000_000;
+    assert!(
+        fs.db().push_queue_claim_next(now).is_none(),
+        "derived inode must not be claimed by push worker"
+    );
+}
+
+#[tokio::test]
+async fn test_poison_skips_claim_next() {
+    let fs = fs();
+    let (attr, _) = fs
+        .create_file(ROOT, "bad.xyz", 0o644, UID, GID)
+        .await
+        .unwrap();
+    fs.db()
+        .push_queue_upsert("/bad.xyz", PushOp::Create, Some(attr.ino), None, None, 1);
+    fs.db().push_queue_poison("/bad.xyz", 415, "unsupported", 2);
+    assert!(
+        fs.db().push_queue_claim_next(10).is_none(),
+        "poisoned row must not be claimed"
+    );
+}
+
+#[tokio::test]
+async fn test_create_derived_sibling_writes_readonly_file() {
+    let fs = fs();
+    let _ino = fs
+        .create_derived_sibling("/orphan.smfs-error.txt", "server said: unsupported")
+        .unwrap();
+    let attr = fs
+        .lookup(ROOT, "orphan.smfs-error.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(attr.mode & 0o777, 0o444);
+    assert!(fs.db().is_derived(attr.ino));
+    assert_eq!(attr.size as usize, "server said: unsupported".len());
+}
+
+#[tokio::test]
+async fn test_unlink_cascade_removes_transcription_sibling() {
+    let fs = fs();
+    // User writes a raw file locally.
+    fs.create_file(ROOT, "cat.png", 0o644, UID, GID)
+        .await
+        .unwrap();
+    // Server-derived transcript sibling is materialized.
+    fs.create_derived_sibling("/cat.png.image-transcription.md", "cat photo")
+        .unwrap();
+    assert!(fs
+        .lookup(ROOT, "cat.png.image-transcription.md")
+        .await
+        .unwrap()
+        .is_some());
+    fs.unlink(ROOT, "cat.png").await.unwrap();
+    assert!(fs.lookup(ROOT, "cat.png").await.unwrap().is_none());
+    assert!(
+        fs.lookup(ROOT, "cat.png.image-transcription.md")
+            .await
+            .unwrap()
+            .is_none(),
+        "sibling transcript must be cascade-removed"
+    );
+}
+
+#[tokio::test]
+async fn test_rename_cascade_moves_transcription_sibling() {
+    let fs = fs();
+    fs.create_file(ROOT, "cat.png", 0o644, UID, GID)
+        .await
+        .unwrap();
+    fs.create_derived_sibling("/cat.png.image-transcription.md", "content")
+        .unwrap();
+    fs.rename(ROOT, "cat.png", ROOT, "kitty.png").await.unwrap();
+    assert!(fs
+        .lookup(ROOT, "cat.png.image-transcription.md")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(fs
+        .lookup(ROOT, "kitty.png.image-transcription.md")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn test_binary_content_detection_nonutf8() {
+    // JPEG magic bytes: FF D8 FF — definitely not valid UTF-8. Build at
+    // runtime so clippy doesn't try to const-evaluate the slice.
+    let bytes: Vec<u8> = vec![0xFF, 0xD8, 0xFF];
+    assert!(std::str::from_utf8(&bytes).is_err());
+    // Plain ASCII is valid UTF-8.
+    assert!(std::str::from_utf8(b"hello world").is_ok());
+}
+
+#[tokio::test]
+async fn test_file_size_cap_enforced() {
+    let fs = fs();
+    let (_, handle) = fs
+        .create_file(ROOT, "big.bin", 0o644, UID, GID)
+        .await
+        .unwrap();
+    // Writing at offset > 100MB must fail.
+    let err = handle
+        .write(101 * 1024 * 1024, b"x")
+        .await
+        .expect_err("write past cap must fail");
+    assert!(matches!(err, VfsError::InvalidPath(_)));
+}

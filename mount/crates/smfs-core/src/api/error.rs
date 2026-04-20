@@ -15,6 +15,10 @@ pub enum ApiError {
     #[error("rate limited (429)")]
     RateLimited,
 
+    /// Permanent 4xx rejection (not retryable).
+    #[error("rejected ({status}): {body}")]
+    Rejected { status: u16, body: String },
+
     #[error("server error ({status}): {body}")]
     Server { status: u16, body: String },
 }
