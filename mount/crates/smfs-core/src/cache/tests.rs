@@ -669,3 +669,4 @@ async fn test_file_size_cap_enforced() {
         .expect_err("write past cap must fail");
     assert!(matches!(err, VfsError::InvalidPath(_)));
 }
+

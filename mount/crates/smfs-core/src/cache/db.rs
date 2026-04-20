@@ -275,6 +275,12 @@ impl Db {
         remote_id: Option<&str>,
         now_ms: i64,
     ) {
+        // macOS Finder + Spotlight scribble metadata files next to every
+        // real file (._*, .DS_Store, …). Local FS accepts them; we just
+        // don't ship them to the server.
+        if is_macos_noise_path(filepath) {
+            return;
+        }
         let conn = self.conn.lock();
         let op_str = op.as_str();
         let content_i64 = content_ino.map(|n| n as i64);
@@ -711,6 +717,37 @@ impl std::fmt::Debug for Db {
     }
 }
 
+pub(crate) fn is_macos_noise_path(filepath: &str) -> bool {
+    let trimmed = filepath.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return false;
+    }
+    let first = trimmed.split('/').next().unwrap_or("");
+    let basename = trimmed.rsplit('/').next().unwrap_or("");
+
+    if first.starts_with(".Spotlight-V100")
+        || first.starts_with(".Trashes")
+        || first.starts_with(".fseventsd")
+        || first.starts_with(".TemporaryItems")
+    {
+        return true;
+    }
+    if basename.starts_with("._") {
+        return true;
+    }
+    matches!(
+        basename,
+        ".DS_Store"
+            | ".localized"
+            | ".apdisk"
+            | ".VolumeIcon.icns"
+            | ".metadata_never_index"
+            | ".metadata_never_index_unless_rootfs"
+            | ".com.apple.timemachine.donotpresent"
+            | "Icon\r"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,5 +816,63 @@ mod tests {
             .unwrap();
         assert_eq!(mode as u32, DEFAULT_DIR_MODE);
         assert_eq!(nlink, 2);
+    }
+
+    #[test]
+    fn is_macos_noise_path_matches_known_patterns() {
+        assert!(is_macos_noise_path("/foo/._bar.png"));
+        assert!(is_macos_noise_path("/._at-root.png"));
+        assert!(is_macos_noise_path("/path/.DS_Store"));
+        assert!(is_macos_noise_path("/.DS_Store"));
+        assert!(is_macos_noise_path("/.Spotlight-V100/Store-V2/foo"));
+        assert!(is_macos_noise_path("/.Trashes/501/stuff"));
+        assert!(is_macos_noise_path("/.fseventsd/fseventsd-uuid"));
+        assert!(is_macos_noise_path("/.TemporaryItems/folder"));
+        assert!(is_macos_noise_path("/dir/.localized"));
+        assert!(is_macos_noise_path("/dir/Icon\r"));
+        assert!(!is_macos_noise_path("/notes/foo.md"));
+        assert!(!is_macos_noise_path("/cat.png"));
+        assert!(!is_macos_noise_path("/sub/normal.txt"));
+    }
+
+    #[test]
+    fn push_queue_skips_apple_double() {
+        let db = Db::open_in_memory().unwrap();
+        db.push_queue_upsert("/foo/._bar.png", PushOp::Create, None, None, None, 1);
+        assert!(
+            db.push_queue_claim_next(10).is_none(),
+            "AppleDouble sidecar must not be enqueued"
+        );
+    }
+
+    #[test]
+    fn push_queue_skips_ds_store() {
+        let db = Db::open_in_memory().unwrap();
+        db.push_queue_upsert("/path/.DS_Store", PushOp::Create, None, None, None, 1);
+        assert!(db.push_queue_claim_next(10).is_none());
+    }
+
+    #[test]
+    fn push_queue_skips_spotlight() {
+        let db = Db::open_in_memory().unwrap();
+        db.push_queue_upsert(
+            "/.Spotlight-V100/Store-V2",
+            PushOp::Create,
+            None,
+            None,
+            None,
+            1,
+        );
+        assert!(db.push_queue_claim_next(10).is_none());
+    }
+
+    #[test]
+    fn push_queue_accepts_normal_paths() {
+        let db = Db::open_in_memory().unwrap();
+        db.push_queue_upsert("/notes/foo.md", PushOp::Create, None, None, None, 1);
+        assert!(
+            db.push_queue_claim_next(10).is_some(),
+            "normal path must enqueue"
+        );
     }
 }
