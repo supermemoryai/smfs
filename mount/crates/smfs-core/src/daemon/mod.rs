@@ -85,11 +85,9 @@ pub fn cleanup_stale(tag: &str) -> bool {
             let _ = std::fs::remove_file(socket_path(tag));
             cleaned = true;
         }
-        None => {
-            if socket_path(tag).exists() {
-                let _ = std::fs::remove_file(socket_path(tag));
-                cleaned = true;
-            }
+        None if socket_path(tag).exists() => {
+            let _ = std::fs::remove_file(socket_path(tag));
+            cleaned = true;
         }
         _ => {}
     }
