@@ -10,7 +10,7 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/supermemoryai/supermemoryfs"
+repository = "https://github.com/supermemoryai/smfs"
 authors = ["Supermemory <support@supermemory.ai>"]
 
 [workspace.dependencies]

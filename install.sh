@@ -9,7 +9,7 @@ if [[ -n "$TARGET" ]] && [[ ! "$TARGET" =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+(-[^[:
     exit 1
 fi
 
-REPO="supermemoryai/supermemoryfs"
+REPO="supermemoryai/smfs"
 RELEASES_URL="https://github.com/$REPO/releases"
 DOWNLOAD_DIR="$HOME/.supermemory/downloads"
 
