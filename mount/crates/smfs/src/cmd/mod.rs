@@ -16,6 +16,7 @@ pub mod daemon_inner;
 pub mod daemon_runtime;
 pub mod grep;
 pub mod init;
+pub mod install;
 pub mod list;
 pub mod login;
 pub mod logout;
@@ -58,6 +59,9 @@ pub enum Command {
     /// Install the grep shell wrapper for transparent semantic search
     Init(init::Args),
 
+    /// Self-install: move this binary to ~/.local/bin and print PATH hint
+    Install(install::Args),
+
     /// Remove stored credentials
     Logout(logout::Args),
 
@@ -77,6 +81,7 @@ pub async fn dispatch(cmd: Command) -> Result<()> {
         Command::Mount(args) => mount::run(args).await,
         Command::Grep(args) => grep::run(args).await,
         Command::Init(args) => init::run(args).await,
+        Command::Install(args) => install::run(args).await,
         Command::Logout(args) => logout::run(args).await,
         Command::Unmount(args) => unmount::run(args).await,
         Command::Status(args) => status::run(args).await,
