@@ -1,13 +1,7 @@
 # Rust
-mount/target/
+target/
+target_linux/
 **/*.rs.bk
-
-# TypeScript (bash/ — not built yet)
-bash/node_modules/
-bash/dist/
-bash/build/
-bash/*.tsbuildinfo
-bash/.turbo/
 
 # supermemoryfs runtime state
 *.db
@@ -18,7 +12,7 @@ dev-mnt/
 **/tests/*_live.rs
 
 # End-to-end verify suite — local-only dev tooling, not part of the shipped product.
-mount/verify/
+verify/
 
 # Editors
 .vscode/

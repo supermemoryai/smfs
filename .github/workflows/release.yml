@@ -3,11 +3,11 @@ name: release
 on:
   push:
     tags:
-      - "mount-v*"
+      - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "tag to build (e.g. mount-v0.0.1)"
+        description: "tag to build (e.g. v0.0.1)"
         required: true
 
 permissions:
@@ -36,9 +36,6 @@ jobs:
             os: ubuntu-22.04
             platform: linux-arm64
     runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: mount
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,7 +54,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: mount
           key: ${{ matrix.target }}
 
       - name: cargo build --release
@@ -69,9 +65,9 @@ jobs:
 
       - name: stage artifact
         run: |
-          mkdir -p ../dist
-          cp target/${{ matrix.target }}/release/smfs ../dist/smfs-${{ matrix.platform }}
-          ( cd ../dist && shasum -a 256 smfs-${{ matrix.platform }} > smfs-${{ matrix.platform }}.sha256 )
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/smfs dist/smfs-${{ matrix.platform }}
+          ( cd dist && shasum -a 256 smfs-${{ matrix.platform }} > smfs-${{ matrix.platform }}.sha256 )
 
       - uses: actions/upload-artifact@v4
         with:
@@ -93,7 +89,7 @@ jobs:
         id: meta
         run: |
           TAG="${{ inputs.tag || github.ref_name }}"
-          VERSION="${TAG#mount-v}"
+          VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           if [[ "$VERSION" == *-* ]]; then

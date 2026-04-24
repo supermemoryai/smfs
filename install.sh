@@ -51,11 +51,11 @@ resolve_latest_version() {
     if [ "$DOWNLOADER" = "curl" ]; then
         curl -fsI "$RELEASES_URL/latest" \
             | awk -F'/' 'tolower($1) ~ /^location:/ { sub(/\r$/, "", $NF); print $NF }' \
-            | sed -n 's/^mount-v//p'
+            | sed -n 's/^v//p'
     else
         wget -q --method=HEAD --server-response "$RELEASES_URL/latest" 2>&1 \
             | awk -F'/' '/Location:/ { sub(/\r$/, "", $NF); print $NF }' \
-            | sed -n 's/^mount-v//p'
+            | sed -n 's/^v//p'
     fi
 }
 
@@ -103,7 +103,7 @@ if [ -z "$version" ]; then
     exit 1
 fi
 
-asset_base="$RELEASES_URL/download/mount-v$version"
+asset_base="$RELEASES_URL/download/v$version"
 manifest_json=$(download_file "$asset_base/manifest.json")
 
 if [ "$HAS_JQ" = true ]; then
