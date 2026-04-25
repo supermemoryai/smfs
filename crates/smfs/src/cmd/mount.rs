@@ -308,7 +308,9 @@ fn resolve_tag_and_path(
         let tag = canon
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .ok_or_else(|| anyhow::anyhow!("cannot derive container tag from path '{positional}'"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("cannot derive container tag from path '{positional}'")
+            })?;
         Ok((tag, canon))
     } else {
         let mount_path = explicit_path.unwrap_or_else(|| {
