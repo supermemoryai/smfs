@@ -81,6 +81,12 @@ pub struct Args {
     /// baseline measurement; not part of the supported user surface.
     #[arg(long, hide = true)]
     pub no_inject_hint: bool,
+
+    /// Import pre-existing files from the mount directory into the
+    /// Supermemory container. When the mount path already contains files,
+    /// this flag skips the interactive prompt and imports them automatically.
+    #[arg(long)]
+    pub import_existing: bool,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -92,12 +98,7 @@ pub async fn run(args: Args) -> Result<()> {
         None => MountBackend::default(),
     };
 
-    // 2. Resolve mount path (default: ./<container_tag>/ in cwd).
-    let mount_path = args.path.clone().unwrap_or_else(|| {
-        std::env::current_dir()
-            .expect("cannot determine current directory")
-            .join(&args.container_tag)
-    });
+    let (container_tag, mount_path) = resolve_tag_and_path(&args.container_tag, args.path)?;
 
     let api_key = super::auth::resolve_api_key(args.key.as_deref(), Some(&mount_path))?;
     let api_url_str = args
@@ -120,11 +121,13 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
+    let import_existing = args.import_existing || prompt_import_if_nonempty(&mount_path)?;
+
     if args.foreground {
         // Inline path — run the daemon body in this process. Ctrl-C / SIGTERM
         // still unmount cleanly via the IPC shutdown notify.
         let cfg = super::daemon_runtime::DaemonConfig {
-            container_tag: args.container_tag.clone(),
+            container_tag: container_tag.clone(),
             mount_path,
             backend,
             api_key,
@@ -136,6 +139,7 @@ pub async fn run(args: Args) -> Result<()> {
             deletion_scan_interval: args.deletion_scan_interval,
             no_sync: args.no_sync,
             drain_timeout: args.drain_timeout,
+            import_existing,
         };
         return super::daemon_runtime::run(cfg).await;
     }
@@ -143,22 +147,22 @@ pub async fn run(args: Args) -> Result<()> {
     // Default path — fork into a background daemon via `smfs daemon-inner`.
     //
     // Refuse if another daemon already owns this tag.
-    if let Some(pid) = smfs_core::daemon::read_pid(&args.container_tag) {
+    if let Some(pid) = smfs_core::daemon::read_pid(&container_tag) {
         if smfs_core::daemon::pid_alive(pid) {
             anyhow::bail!(
                 "tag '{}' is already mounted (pid {}). Use `smfs unmount` first.",
-                args.container_tag,
+                container_tag,
                 pid,
             );
         }
     }
     // Clean any leftover socket/pid from a prior crash.
-    smfs_core::daemon::cleanup_stale(&args.container_tag);
+    smfs_core::daemon::cleanup_stale(&container_tag);
     smfs_core::daemon::ensure_dirs()?;
 
     // Open the per-tag log file for the child's stdout/stderr. Parent
     // handoff: the daemon never writes to the controlling TTY again.
-    let log_path = smfs_core::daemon::log_path(&args.container_tag);
+    let log_path = smfs_core::daemon::log_path(&container_tag);
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -169,7 +173,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("daemon-inner")
         .arg("--container-tag")
-        .arg(&args.container_tag)
+        .arg(&container_tag)
         .arg("--mount")
         .arg(&mount_path)
         .arg("--key")
@@ -195,6 +199,9 @@ pub async fn run(args: Args) -> Result<()> {
     if args.no_sync {
         cmd.arg("--no-sync");
     }
+    if import_existing {
+        cmd.arg("--import-existing");
+    }
     cmd.arg("--drain-timeout")
         .arg(args.drain_timeout.to_string());
     cmd.stdin(std::process::Stdio::null())
@@ -206,14 +213,14 @@ pub async fn run(args: Args) -> Result<()> {
     // The child will self-install a session via setsid; parent just waits
     // until the child's IPC socket comes up, then exits.
 
-    let socket = smfs_core::daemon::socket_path(&args.container_tag);
+    let socket = smfs_core::daemon::socket_path(&container_tag);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut last_err: Option<String> = None;
     loop {
         // Ping the daemon — once it responds, we know the mount is live.
         if socket.exists() {
             match smfs_core::daemon::client::send_request(
-                &args.container_tag,
+                &container_tag,
                 smfs_core::daemon::protocol::Request::Ping,
             )
             .await
@@ -248,7 +255,7 @@ pub async fn run(args: Args) -> Result<()> {
     eprintln!(
         "supermemoryfs mounted at {} (tag: {}, pid: {})",
         mount_path.display(),
-        args.container_tag,
+        container_tag,
         child_pid,
     );
     eprintln!("log: {}", log_path.display());
@@ -256,7 +263,7 @@ pub async fn run(args: Args) -> Result<()> {
     // Best-effort: opportunistically clean orphan hint blocks from prior
     // crashed daemons, then install the path-scoped hint for this mount.
     // Failures here must NEVER fail the mount itself.
-    install_hint_best_effort(&args.container_tag, &mount_path, args.no_inject_hint);
+    install_hint_best_effort(&container_tag, &mount_path, args.no_inject_hint);
 
     Ok(())
 }
@@ -310,4 +317,83 @@ fn friendly_path(p: &std::path::Path) -> String {
         }
     }
     p.display().to_string()
+}
+
+fn prompt_import_if_nonempty(mount_path: &std::path::Path) -> Result<bool> {
+    if !mount_path.is_dir() {
+        return Ok(false);
+    }
+    let has_files = std::fs::read_dir(mount_path)
+        .map(|mut rd| rd.next().is_some())
+        .unwrap_or(false);
+    if !has_files {
+        return Ok(false);
+    }
+
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "warning: mount path '{}' is not empty. \
+             Existing files will be hidden during mount. \
+             Use --import-existing to import them.",
+            mount_path.display(),
+        );
+        return Ok(false);
+    }
+
+    let count = count_files_recursive(mount_path);
+    eprintln!(
+        "warning: mount path '{}' contains {count} existing file(s).",
+        mount_path.display(),
+    );
+    eprintln!("These files will be hidden while the filesystem is mounted.");
+    eprint!("Import them into the Supermemory container? [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim().eq_ignore_ascii_case("y"))
+}
+
+fn looks_like_path(s: &str) -> bool {
+    s == "." || s == ".." || s.contains('/') || std::path::Path::new(s).is_dir()
+}
+
+fn resolve_tag_and_path(
+    positional: &str,
+    explicit_path: Option<PathBuf>,
+) -> anyhow::Result<(String, PathBuf)> {
+    if looks_like_path(positional) {
+        if explicit_path.is_some() {
+            anyhow::bail!("cannot use both a path as the tag and --path");
+        }
+        let canon = std::fs::canonicalize(positional)
+            .unwrap_or_else(|_| std::path::PathBuf::from(positional));
+        let tag = canon
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow::anyhow!("cannot derive container tag from path '{positional}'"))?;
+        Ok((tag, canon))
+    } else {
+        let mount_path = explicit_path.unwrap_or_else(|| {
+            std::env::current_dir()
+                .expect("cannot determine current directory")
+                .join(positional)
+        });
+        Ok((positional.to_string(), mount_path))
+    }
+}
+
+fn count_files_recursive(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            count += count_files_recursive(&entry.path());
+        } else if ft.is_file() {
+            count += 1;
+        }
+    }
+    count
 }

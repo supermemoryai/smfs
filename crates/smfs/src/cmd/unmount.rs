@@ -91,11 +91,11 @@ fn resolve(target: Option<String>) -> Result<(String, Option<PathBuf>)> {
     if let Some(t) = target.as_deref() {
         let as_path = PathBuf::from(t);
         if as_path.exists() && as_path.is_dir() {
-            // Walk up from the given path to find .smfs
-            let marker = read_marker_from(&as_path).with_context(|| {
-                format!("no .smfs marker found at or above {}", as_path.display())
+            let canon = std::fs::canonicalize(&as_path).unwrap_or(as_path);
+            let marker = read_marker_from(&canon).with_context(|| {
+                format!("no .smfs marker found at or above {}", canon.display())
             })?;
-            return Ok((marker.tag, Some(as_path)));
+            return Ok((marker.tag, Some(canon)));
         }
         // Not a path on disk — treat as tag.
         return Ok((t.to_string(), None));

@@ -826,6 +826,30 @@ impl SupermemoryFs {
     pub async fn pull_once(self: &Arc<Self>) -> anyhow::Result<usize> {
         crate::sync::pull::delta_pull(self).await
     }
+
+    /// Import a host file into the VFS. Returns `Ok(false)` if already exists.
+    pub async fn import_file(&self, filepath: &str, contents: &[u8]) -> Result<bool, String> {
+        let pos = filepath.rfind('/').ok_or("filepath must contain '/'")?;
+        let dir = if pos == 0 { "/" } else { &filepath[..pos] };
+        let name = &filepath[pos + 1..];
+        if name.is_empty() {
+            return Err("filepath must not end with '/'".into());
+        }
+
+        let parent_ino = self.ensure_dirs(dir).map_err(|e| e.to_string())?;
+
+        let (_, handle) = match self.create_file(parent_ino, name, 0o644, 0, 0).await {
+            Ok(v) => v,
+            Err(crate::vfs::VfsError::AlreadyExists) => return Ok(false),
+            Err(e) => return Err(e.to_string()),
+        };
+
+        if !contents.is_empty() {
+            handle.write(0, contents).await.map_err(|e| e.to_string())?;
+        }
+        handle.flush().await.map_err(|e| e.to_string())?;
+        Ok(true)
+    }
 }
 
 /// Snapshot of a push_queue row returned by [`SupermemoryFs::push_queue_inspect`].

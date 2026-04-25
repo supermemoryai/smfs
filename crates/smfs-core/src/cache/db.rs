@@ -767,7 +767,7 @@ impl std::fmt::Debug for Db {
     }
 }
 
-pub(crate) fn is_macos_noise_path(filepath: &str) -> bool {
+pub fn is_macos_noise_path(filepath: &str) -> bool {
     let trimmed = filepath.trim_start_matches('/');
     if trimmed.is_empty() {
         return false;

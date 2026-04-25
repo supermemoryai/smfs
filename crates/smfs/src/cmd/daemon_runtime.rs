@@ -36,6 +36,7 @@ pub struct DaemonConfig {
     pub deletion_scan_interval: u64,
     pub no_sync: bool,
     pub drain_timeout: u64,
+    pub import_existing: bool,
 }
 
 pub async fn run(cfg: DaemonConfig) -> Result<()> {
@@ -43,6 +44,17 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     if created_dir {
         std::fs::create_dir_all(&cfg.mount_path)?;
     }
+
+    // Must scan before mounting -- the mount shadows pre-existing files.
+    let pre_existing_files = if cfg.import_existing && !created_dir {
+        let files = collect_files_recursive(&cfg.mount_path, &cfg.mount_path);
+        if !files.is_empty() {
+            eprintln!("collected {} file(s) for import", files.len());
+        }
+        files
+    } else {
+        Vec::new()
+    };
 
     // uid/gid of the invoking user for the mount ownership.
     #[allow(unsafe_code)]
@@ -146,6 +158,24 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
                 tracing::warn!(error = %e, "initial sync failed; mount will continue");
             }
         }
+    }
+
+    // Import after initial pull so we skip files already in the container.
+    if !pre_existing_files.is_empty() {
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        let mut errors = 0usize;
+        for (rel_path, contents) in &pre_existing_files {
+            match fs.import_file(rel_path, contents).await {
+                Ok(true) => imported += 1,
+                Ok(false) => skipped += 1,
+                Err(e) => {
+                    tracing::warn!(path = %rel_path, error = %e, "import failed");
+                    errors += 1;
+                }
+            }
+        }
+        eprintln!("import: {imported} imported, {skipped} already existed, {errors} failed");
     }
 
     // Sync engine: push always on, pull gated by --no-sync.
@@ -279,4 +309,35 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         let _ = std::fs::remove_dir(&cfg.mount_path);
     }
     Ok(())
+}
+
+/// Collect `(vfs_path, contents)` pairs from a directory tree.
+fn collect_files_recursive(
+    dir: &std::path::Path,
+    root: &std::path::Path,
+) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        let path = entry.path();
+        if ft.is_dir() {
+            out.extend(collect_files_recursive(&path, root));
+        } else if ft.is_file() {
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            let vfs_path = format!("/{}", rel.to_string_lossy());
+            if smfs_core::cache::is_macos_noise_path(&vfs_path) {
+                continue;
+            }
+            match std::fs::read(&path) {
+                Ok(data) => out.push((vfs_path, data)),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "skipping unreadable file");
+                }
+            }
+        }
+    }
+    out
 }

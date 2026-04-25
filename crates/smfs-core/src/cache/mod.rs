@@ -12,7 +12,7 @@ mod file;
 mod fs;
 pub mod profile;
 
-pub use db::{Db, DEFAULT_CHUNK_SIZE, DENTRY_CACHE_MAX, ROOT_INO};
+pub use db::{is_macos_noise_path, Db, DEFAULT_CHUNK_SIZE, DENTRY_CACHE_MAX, ROOT_INO};
 pub use fs::{ReconcileOutcome, SupermemoryFs};
 
 pub(crate) use fs::parse_iso_to_ms;
