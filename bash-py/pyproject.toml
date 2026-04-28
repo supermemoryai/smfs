@@ -26,7 +26,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/supermemoryai/smfs/tree/main/python#readme"
+Homepage = "https://github.com/supermemoryai/smfs/tree/main/bash-py#readme"
 Repository = "https://github.com/supermemoryai/smfs"
 Issues = "https://github.com/supermemoryai/smfs/issues"
 
