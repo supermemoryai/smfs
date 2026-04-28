@@ -1,10 +1,16 @@
-"""Production-grade integration test for the Python SDK against a live Supermemory container.
+"""End-to-end test against a live Supermemory container. Skipped unless
+SUPERMEMORY_API_KEY is set, so default test runs (without secrets) stay green.
 
-Mirrors bash/tests/integration.test.ts from the TS package. Skipped unless
-SUPERMEMORY_API_KEY is set. Each run creates its own throwaway container,
-seeds it, and best-effort cleans up at the end.
+Run locally with:
+    SUPERMEMORY_API_KEY=sk-... uv run pytest tests/test_integration.py -v
 """
-import asyncio, os, secrets, time
+from __future__ import annotations
+
+import asyncio
+import os
+import secrets
+import time
+
 import pytest
 
 pytestmark = pytest.mark.skipif(
@@ -19,22 +25,31 @@ CONTAINER_TAG = f"bash_integ_py_{int(time.time())}_{secrets.token_hex(3)}"
 
 SEED_FILES = [
     ("/todo.md", "- [ ] write the report\n- [ ] review pull requests\n- [x] respond to mom\n"),
-    ("/journal/2026-04-25.md",
-     "Friday — long debug session on the rename bug. Found that PATCH with content silently ignores filepath. PATCH without content honors it.\n"),
-    ("/journal/2026-04-26.md",
-     "Saturday — built the createBash factory. The synthetic-dir + customCommand resolution interaction was painful.\n"),
-    ("/work/projects/auth.md",
-     "OAuth implementation handles refresh tokens with a 30-day TTL. Access tokens expire in 15 minutes. Bearer tokens are passed in the Authorization header.\n"),
-    ("/work/projects/billing.md",
-     "Stripe webhooks for invoice.paid, subscription.updated, customer.subscription.deleted. Webhook signing secret rotates every 90 days.\n"),
+    (
+        "/journal/2026-04-25.md",
+        "Friday — long debug session on the rename bug. Found that PATCH with content silently ignores filepath. PATCH without content honors it.\n",
+    ),
+    (
+        "/journal/2026-04-26.md",
+        "Saturday — built the createBash factory. The synthetic-dir + customCommand resolution interaction was painful.\n",
+    ),
+    (
+        "/work/projects/auth.md",
+        "OAuth implementation handles refresh tokens with a 30-day TTL. Access tokens expire in 15 minutes. Bearer tokens are passed in the Authorization header.\n",
+    ),
+    (
+        "/work/projects/billing.md",
+        "Stripe webhooks for invoice.paid, subscription.updated, customer.subscription.deleted. Webhook signing secret rotates every 90 days.\n",
+    ),
     ("/work/notes.md", "Standup at 10am Mondays. Sprint planning every other Wednesday.\n"),
-    ("/reading/highlights.txt",
-     "Photosynthesis is the process by which plants convert sunlight into chemical energy. The reaction takes place in chloroplasts.\n"),
+    (
+        "/reading/highlights.txt",
+        "Photosynthesis is the process by which plants convert sunlight into chemical energy. The reaction takes place in chloroplasts.\n",
+    ),
 ]
 
 
 async def wait_terminal(volume: SupermemoryVolume, doc_id: str, max_s: float = 30.0) -> str | None:
-    """Poll until doc reaches done|failed. Mirror of the TS test helper."""
     start = time.monotonic()
     while time.monotonic() - start < max_s:
         try:
@@ -56,11 +71,7 @@ async def session():
     bash, vol = res.bash, res.volume
     await vol.remove_by_prefix("/")
     for path, content in SEED_FILES:
-        r = await bash.exec(f"echo {content!r} > {path}")
-        # Python shell may not have heredoc support; use single-line write via volume directly for multi-line:
-        if "\n" in content[:-1]:  # multi-line
-            await vol.add_doc(path, content)
-    # wait for ingestion
+        await vol.add_doc(path, content)
     for path, _ in SEED_FILES:
         doc_id = vol.path_index.resolve(path)
         if doc_id:
@@ -73,22 +84,25 @@ async def session():
     await vol.client.close()
 
 
-# === 17 test cases mirroring bash/tests/integration.test.ts ===
+# ── core parity (matches bash/tests/integration.test.ts) ──────────────────
 
-async def test_pwd_returns_home_user(session):
+
+async def test_pwd_returns_root(session):
     bash, _ = session
     r = await bash.exec("pwd")
     assert r.exit_code == 0
-    assert r.stdout.strip() == "/home/user"
+    assert r.stdout.strip() == "/"
 
 
-async def test_ls_root_lists_seeded_top_level(session):
+async def test_ls_root_lists_only_seeded_top_level_entries(session):
     bash, _ = session
     r = await bash.exec("ls /")
     assert r.exit_code == 0
     seen = set(r.stdout.split())
-    for expected in ["dev", "home", "tmp", "journal", "reading", "todo.md", "work"]:
+    for expected in ("journal", "reading", "todo.md", "work"):
         assert expected in seen, f"missing {expected!r} in 'ls /' output: {seen!r}"
+    for unexpected in ("dev", "home", "tmp"):
+        assert unexpected not in seen, f"'{unexpected}' should not appear in 'ls /'"
 
 
 async def test_ls_work_lists_nested_entries(session):
@@ -216,7 +230,6 @@ async def test_rm_deletes_file(session):
 
 async def test_sgrep_finds_seeded_file_by_topic(session):
     bash, vol = session
-    # wait for memory pipeline (up to 60s)
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         r = await vol.search("OAuth refresh tokens")
@@ -228,3 +241,43 @@ async def test_sgrep_finds_seeded_file_by_topic(session):
     r = await bash.exec("sgrep 'OAuth refresh tokens'")
     assert r.exit_code == 0
     assert "/work/projects/auth.md" in r.stdout
+
+
+# ── new cases: profile virtual file + validation pipeline ─────────────────
+
+
+async def test_profile_md_appears_in_ls_root(session):
+    bash, _ = session
+    r = await bash.exec("ls /")
+    assert "profile.md" in r.stdout.split(), r.stdout
+
+
+async def test_cat_profile_returns_real_content(session):
+    bash, _ = session
+    r = await bash.exec("cat /profile.md")
+    assert r.exit_code == 0
+    assert "# Memory Profile" in r.stdout
+
+
+async def test_write_to_profile_rejected_with_eperm(session):
+    bash, _ = session
+    r = await bash.exec("echo overwrite > /profile.md")
+    assert r.exit_code == 1
+    assert "EPERM" in r.stderr
+
+
+async def test_filepath_collision_returns_enotdir(session):
+    bash, _ = session
+    probe = "/probe-collision.md"
+    w1 = await bash.exec(f"echo first > {probe}")
+    assert w1.exit_code == 0
+    w2 = await bash.exec(f"echo second > {probe}/inner.md")
+    assert w2.exit_code == 1, w2
+    assert "ENOTDIR" in w2.stderr or "Not a directory" in w2.stderr, w2.stderr
+
+
+async def test_invalid_filepath_shape_returns_einval(session):
+    bash, _ = session
+    r = await bash.exec("echo hi > /noext")
+    assert r.exit_code == 1
+    assert "EINVAL" in r.stderr
