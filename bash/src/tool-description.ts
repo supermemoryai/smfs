@@ -2,6 +2,8 @@ export const TOOL_DESCRIPTION = `You have access to a bash environment whose fil
 
 Default working directory: \`/\`. The entire filesystem is yours — organize it however you want.
 
+\`/profile.md\` is read-only — memories synthesized from your files. Cat it for context.
+
 Standard shell commands work as expected: pwd, cd, ls, cat, stat, mkdir, rm, rmdir, mv, cp, echo, grep, head, tail, wc, sort, sed, awk, find, [ -f ], [ -d ], pipes, redirects, variables, conditionals, loops. You can read, write, append, move, copy, and delete files freely.
 
 Two grep flavors:

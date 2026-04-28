@@ -76,6 +76,11 @@ pub struct Args {
     /// mount. Default 30s.
     #[arg(long, default_value_t = 30)]
     pub drain_timeout: u64,
+
+    /// Internal: skip injecting the path-scoped agent hint. Used for
+    /// baseline measurement; not part of the supported user surface.
+    #[arg(long, hide = true)]
+    pub no_inject_hint: bool,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -247,5 +252,65 @@ pub async fn run(args: Args) -> Result<()> {
         child_pid,
     );
     eprintln!("log: {}", log_path.display());
+
+    // Best-effort: opportunistically clean orphan hint blocks from prior
+    // crashed daemons, then install the path-scoped hint for this mount.
+    // Failures here must NEVER fail the mount itself.
+    install_hint_best_effort(&args.container_tag, &mount_path, args.no_inject_hint);
+
     Ok(())
+}
+
+/// Sweep stale hints + install the new one. Logs to stderr; never fails the
+/// caller.
+fn install_hint_best_effort(tag: &str, mount_path: &std::path::Path, skip_install: bool) {
+    use smfs_core::agent_hint;
+
+    match agent_hint::sweep_orphans(Some(tag)) {
+        Ok(report) if !report.is_empty() => {
+            let total_tags: usize = report.iter().map(|(_, ts)| ts.len()).sum();
+            let tags_joined: Vec<String> = report
+                .iter()
+                .flat_map(|(_, ts)| ts.iter().cloned())
+                .collect();
+            eprintln!(
+                "✓ Cleaned {} stale hint(s) ({})",
+                total_tags,
+                tags_joined.join(", "),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "agent-hint sweep failed"),
+    }
+
+    if skip_install {
+        return;
+    }
+    // Resolve the absolute, canonical mount path so the rule body names a
+    // path the agent can actually match on (resolves symlinks, removes ./).
+    let canonical = std::fs::canonicalize(mount_path).unwrap_or_else(|_| mount_path.to_path_buf());
+    match agent_hint::install(tag, &canonical) {
+        Ok(written) if !written.is_empty() => {
+            let names: Vec<String> = written
+                .iter()
+                .map(|p| friendly_path(p))
+                .collect();
+            eprintln!(
+                "✓ Updated {} (path-scoped semantic-search hint; auto-removed on unmount)",
+                names.join(", "),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "agent-hint install failed"),
+    }
+}
+
+/// Render a path with `$HOME` collapsed to `~` for cleaner log output.
+fn friendly_path(p: &std::path::Path) -> String {
+    if let Some(home) = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
+        if let Ok(rel) = p.strip_prefix(&home) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    p.display().to_string()
 }

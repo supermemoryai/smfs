@@ -27,6 +27,7 @@ reqwest = { workspace = true }
 rusqlite = { workspace = true }
 directories = { workspace = true }
 lru = { workspace = true }
+fs2 = "0.4"
 
 # Mount backends — target-gated (M3a)
 # nfsserve compiles on both macOS and Linux (pure Rust).
@@ -37,3 +38,6 @@ nfsserve = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

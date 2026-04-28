@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod agent_hint;
 pub mod api;
 pub mod cache;
 pub mod config;

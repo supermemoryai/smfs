@@ -62,7 +62,28 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     println!("unmounted '{tag}'");
+
+    // Best-effort: remove the path-scoped hint we installed at mount time.
+    // Failures here must NEVER fail the unmount.
+    match smfs_core::agent_hint::uninstall(&tag) {
+        Ok(written) if !written.is_empty() => {
+            let names: Vec<String> = written.iter().map(|p| friendly_path(p)).collect();
+            eprintln!("✓ Removed hint from {}", names.join(", "));
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "agent-hint uninstall failed"),
+    }
+
     Ok(())
+}
+
+fn friendly_path(p: &Path) -> String {
+    if let Some(home) = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
+        if let Ok(rel) = p.strip_prefix(&home) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    p.display().to_string()
 }
 
 /// Resolve a tag + mountpoint from the CLI target (path | tag | none).
