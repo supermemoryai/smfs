@@ -482,3 +482,41 @@ async def test_dev_null_no_api_write(shell_and_vol):
     await shell.exec("echo test > /dev/null")
     doc = await vol.get_doc("/dev/null")
     assert doc is None
+
+
+# ── FsError exec wrapper ──────────────────────────────────────────────────
+
+
+class _ThrowingVolume(FakeVolume):
+    """FakeVolume whose add_doc raises an FsError, simulating Volume's
+    assert_writable rejecting a write."""
+
+    def __init__(self, error_factory):
+        super().__init__()
+        self._error_factory = error_factory
+
+    async def add_doc(self, path: str, content):  # type: ignore[override]
+        raise self._error_factory(path)
+
+
+@pytest.mark.asyncio
+async def test_fs_error_caught_and_returned_as_exit_1():
+    from supermemory_bash._errors import eperm
+
+    vol = _ThrowingVolume(lambda p: eperm(p, "addDoc"))
+    shell = Shell(vol, cwd="/")
+    r = await shell.exec("echo hi > /profile.md")
+    assert r.exit_code == 1, r
+    assert "EPERM" in r.stderr, r.stderr
+    assert "bash:" in r.stderr, r.stderr
+
+
+@pytest.mark.asyncio
+async def test_fs_error_einval_caught_and_returned_as_exit_1():
+    from supermemory_bash._errors import einval
+
+    vol = _ThrowingVolume(lambda p: einval(f"'{p}': missing_extension"))
+    shell = Shell(vol, cwd="/")
+    r = await shell.exec("echo hi > /noext")
+    assert r.exit_code == 1, r
+    assert "EINVAL" in r.stderr, r.stderr

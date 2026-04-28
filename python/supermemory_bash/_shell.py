@@ -89,7 +89,10 @@ class Shell:
             script = parse_command(command)
         except UnsupportedSyntaxError as e:
             return ExecResult(stderr=f"parse error: {e}\n", exit_code=2)
-        result = await self._exec_script(script)
+        try:
+            result = await self._exec_script(script)
+        except FsError as err:
+            result = ExecResult(stdout="", stderr=f"bash: {err}\n", exit_code=1)
         self._last_exit = result.exit_code
         return result
 
