@@ -435,7 +435,6 @@ class Shell:
                     return ExecResult(stderr=f"rm: {p}: is a directory\n", exit_code=1)
                 prefix = path if path.endswith("/") else f"{path}/"
                 result = await self.volume.remove_by_prefix(prefix)
-                self.volume.path_index.remove_synthetic_dir(path)
                 if result.errors and not force:
                     return ExecResult(stderr="rm: failed to remove some files\n", exit_code=1)
             else:
@@ -453,12 +452,10 @@ class Shell:
             path = self._resolve(p)
             if self.volume.path_index.is_file(path):
                 return ExecResult(stderr=f"rmdir: {p}: Not a directory\n", exit_code=1)
-            prefix = path if path == "/" else f"{path}/"
-            probe = await self.volume.list_by_prefix(prefix, limit=1)
-            if probe:
-                return ExecResult(stderr=f"rmdir: {p}: Directory not empty\n", exit_code=1)
             if not self.volume.path_index.is_directory(path):
                 return ExecResult(stderr=f"rmdir: {p}: No such file or directory\n", exit_code=1)
+            if not await self.volume.is_dir_empty(path):
+                return ExecResult(stderr=f"rmdir: {p}: Directory not empty\n", exit_code=1)
             self.volume.path_index.remove_synthetic_dir(path)
         return ExecResult()
 
@@ -471,13 +468,10 @@ class Shell:
 
         is_dir = self.volume.path_index.is_directory(src) and not self.volume.path_index.is_file(src)
         if is_dir:
-            src_prefix = src if src.endswith("/") else f"{src}/"
-            dest_prefix = dest if dest.endswith("/") else f"{dest}/"
-            entries = await self.volume.list_by_prefix(src_prefix)
-            for e in entries:
-                new_path = dest_prefix + e.filepath[len(src_prefix):]
-                await self.volume.move_doc(e.filepath, new_path)
-            self.volume.path_index.remove_synthetic_dir(src)
+            result = await self.volume.move_tree(src, dest)
+            if result.errors:
+                msg = f"mv: {paths[0]}: failed to move some files\n"
+                return ExecResult(stderr=msg, exit_code=1)
         else:
             await self.volume.move_doc(src, dest)
         return ExecResult()
@@ -494,12 +488,10 @@ class Shell:
         if is_dir:
             if not recursive:
                 return ExecResult(stderr=f"cp: -r not specified; omitting directory '{paths[0]}'\n", exit_code=1)
-            src_prefix = src if src.endswith("/") else f"{src}/"
-            dest_prefix = dest if dest.endswith("/") else f"{dest}/"
-            entries = await self.volume.list_by_prefix(src_prefix, with_content=True)
-            for e in entries:
-                new_path = dest_prefix + e.filepath[len(src_prefix):]
-                await self.volume.add_doc(new_path, e.content or "")
+            result = await self.volume.copy_tree(src, dest)
+            if result.errors:
+                msg = f"cp: {paths[0]}: failed to copy some files\n"
+                return ExecResult(stderr=msg, exit_code=1)
         else:
             doc = await self.volume.get_doc(src)
             if not doc:

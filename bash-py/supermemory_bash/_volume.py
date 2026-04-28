@@ -324,8 +324,15 @@ class SupermemoryVolume:
                     if doc_id not in failed_ids:
                         self.path_index.remove(p)
                         self.cache.delete(p)
+            self._evict_synthetic_under(prefix)
 
         return RemoveByPrefixResult(deleted=deleted, errors=errors)
+
+    def _evict_synthetic_under(self, prefix: str) -> None:
+        dir_self = prefix[:-1] if prefix.endswith("/") else prefix
+        for d in list(self.path_index.synthetic_dir_paths()):
+            if d == dir_self or d.startswith(prefix):
+                self.path_index.remove_synthetic_dir(d)
 
     async def _remove_by_prefix_via_list(self, prefix: str) -> RemoveByPrefixResult:
         matches: list[tuple[str, str]] = []
@@ -358,6 +365,8 @@ class SupermemoryVolume:
             if doc_id not in erred_ids:
                 self.path_index.remove(fp)
                 self.cache.delete(fp)
+        if not errors:
+            self._evict_synthetic_under(prefix)
         return RemoveByPrefixResult(deleted=deleted, errors=errors)
 
     async def move_doc(self, from_path: str, to_path: str) -> None:
@@ -537,6 +546,53 @@ class SupermemoryVolume:
 
     def mark_synthetic_dir(self, path: str) -> None:
         self.path_index.mark_synthetic_dir(path)
+
+    async def is_dir_empty(self, path: str) -> bool:
+        prefix = path if path == "/" else f"{path}/"
+        probe = await self.list_by_prefix(prefix, limit=1)
+        if probe:
+            return False
+        for d in self.path_index.synthetic_dir_paths():
+            if d != path and d.startswith(prefix):
+                return False
+        return True
+
+    async def move_tree(self, src: str, dest: str) -> RemoveByPrefixResult:
+        src_prefix = src if src.endswith("/") else f"{src}/"
+        dest_prefix = dest if dest.endswith("/") else f"{dest}/"
+        entries = await self.list_by_prefix(src_prefix)
+        errors: list[Exception] = []
+        for e in entries:
+            new_path = dest_prefix + e.filepath[len(src_prefix):]
+            try:
+                await self.move_doc(e.filepath, new_path)
+            except Exception as err:
+                errors.append(err)
+        for d in list(self.path_index.synthetic_dir_paths()):
+            if d == src:
+                self.path_index.remove_synthetic_dir(d)
+            elif d.startswith(src_prefix):
+                self.path_index.remove_synthetic_dir(d)
+                self.path_index.mark_synthetic_dir(dest_prefix + d[len(src_prefix):])
+        self.path_index.mark_synthetic_dir(dest)
+        return RemoveByPrefixResult(deleted=len(entries) - len(errors), errors=errors)
+
+    async def copy_tree(self, src: str, dest: str) -> RemoveByPrefixResult:
+        src_prefix = src if src.endswith("/") else f"{src}/"
+        dest_prefix = dest if dest.endswith("/") else f"{dest}/"
+        entries = await self.list_by_prefix(src_prefix, with_content=True)
+        errors: list[Exception] = []
+        for e in entries:
+            new_path = dest_prefix + e.filepath[len(src_prefix):]
+            try:
+                await self.add_doc(new_path, e.content or "")
+            except Exception as err:
+                errors.append(err)
+        for d in self.path_index.synthetic_dir_paths():
+            if d.startswith(src_prefix):
+                self.path_index.mark_synthetic_dir(dest_prefix + d[len(src_prefix):])
+        self.path_index.mark_synthetic_dir(dest)
+        return RemoveByPrefixResult(deleted=len(entries) - len(errors), errors=errors)
 
     async def search(self, q: str, filepath: str | None = None) -> SearchResp:
         try:

@@ -51,8 +51,51 @@ class FakeVolume:
             del self._files[p]
             self.path_index.remove(p)
             self.cache.delete(p)
+        dir_self = prefix[:-1] if prefix.endswith("/") else prefix
+        for d in list(self.path_index.synthetic_dir_paths()):
+            if d == dir_self or d.startswith(prefix):
+                self.path_index.remove_synthetic_dir(d)
         result = MagicMock()
         result.deleted = len(to_remove)
+        result.errors = []
+        return result
+
+    async def is_dir_empty(self, path: str) -> bool:
+        prefix = path if path == "/" else f"{path}/"
+        for p in self._files:
+            if p.startswith(prefix):
+                return False
+        for d in self.path_index.synthetic_dir_paths():
+            if d != path and d.startswith(prefix):
+                return False
+        return True
+
+    async def move_tree(self, src: str, dest: str) -> MagicMock:
+        src_prefix = src if src.endswith("/") else f"{src}/"
+        dest_prefix = dest if dest.endswith("/") else f"{dest}/"
+        for p in [p for p in list(self._files) if p.startswith(src_prefix)]:
+            await self.move_doc(p, dest_prefix + p[len(src_prefix):])
+        for d in list(self.path_index.synthetic_dir_paths()):
+            if d == src:
+                self.path_index.remove_synthetic_dir(d)
+            elif d.startswith(src_prefix):
+                self.path_index.remove_synthetic_dir(d)
+                self.path_index.mark_synthetic_dir(dest_prefix + d[len(src_prefix):])
+        self.path_index.mark_synthetic_dir(dest)
+        result = MagicMock()
+        result.errors = []
+        return result
+
+    async def copy_tree(self, src: str, dest: str) -> MagicMock:
+        src_prefix = src if src.endswith("/") else f"{src}/"
+        dest_prefix = dest if dest.endswith("/") else f"{dest}/"
+        for p in [p for p in list(self._files) if p.startswith(src_prefix)]:
+            await self.add_doc(dest_prefix + p[len(src_prefix):], self._files[p])
+        for d in self.path_index.synthetic_dir_paths():
+            if d.startswith(src_prefix):
+                self.path_index.mark_synthetic_dir(dest_prefix + d[len(src_prefix):])
+        self.path_index.mark_synthetic_dir(dest)
+        result = MagicMock()
         result.errors = []
         return result
 
@@ -563,3 +606,49 @@ async def test_grep_c_counts_each_match_once(shell_and_vol):
     r = await shell.exec("grep -c apple /file.txt")
     assert r.exit_code == 0, r
     assert r.stdout.strip() == "2", r.stdout
+
+
+# --- Nested-synthetic-dir bugs (from v6 PR review) ---
+
+@pytest.mark.asyncio
+async def test_rm_r_evicts_nested_synthetic_dirs(shell_and_vol):
+    shell, vol = shell_and_vol
+    await shell.exec("mkdir -p /a/b/c")
+    r = await shell.exec("rm -r /a")
+    assert r.exit_code == 0, r
+    assert not vol.path_index.is_directory("/a"), vol.path_index.synthetic_dir_paths()
+    assert not vol.path_index.is_directory("/a/b"), vol.path_index.synthetic_dir_paths()
+    assert not vol.path_index.is_directory("/a/b/c"), vol.path_index.synthetic_dir_paths()
+
+
+@pytest.mark.asyncio
+async def test_rmdir_refuses_dir_with_only_synthetic_children(shell_and_vol):
+    shell, vol = shell_and_vol
+    await shell.exec("mkdir -p /a/b")
+    r = await shell.exec("rmdir /a")
+    assert r.exit_code == 1, r
+    assert "Directory not empty" in r.stderr, r.stderr
+    assert vol.path_index.is_directory("/a"), vol.path_index.synthetic_dir_paths()
+    assert vol.path_index.is_directory("/a/b"), vol.path_index.synthetic_dir_paths()
+
+
+@pytest.mark.asyncio
+async def test_mv_dir_migrates_synthetic_subdirs(shell_and_vol):
+    shell, vol = shell_and_vol
+    await shell.exec("mkdir -p /src/empty")
+    await shell.exec("echo hello > /src/file.md")
+    r = await shell.exec("mv /src /dst")
+    assert r.exit_code == 0, r
+    assert vol.path_index.is_directory("/dst/empty"), vol.path_index.synthetic_dir_paths()
+    assert not vol.path_index.is_directory("/src/empty"), vol.path_index.synthetic_dir_paths()
+
+
+@pytest.mark.asyncio
+async def test_cp_r_replicates_synthetic_subdirs(shell_and_vol):
+    shell, vol = shell_and_vol
+    await shell.exec("mkdir -p /src/empty")
+    await shell.exec("echo hello > /src/file.md")
+    r = await shell.exec("cp -r /src /dst")
+    assert r.exit_code == 0, r
+    assert vol.path_index.is_directory("/dst/empty"), vol.path_index.synthetic_dir_paths()
+    assert vol.path_index.is_directory("/src/empty"), vol.path_index.synthetic_dir_paths()
