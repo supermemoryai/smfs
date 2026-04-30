@@ -543,19 +543,3 @@ mod tests {
         assert_eq!(tag, "my-tag_v2:prod");
     }
 }
-
-fn count_files_recursive(dir: &std::path::Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    let mut count = 0;
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            count += count_files_recursive(&entry.path());
-        } else if ft.is_file() {
-            count += 1;
-        }
-    }
-    count
-}
