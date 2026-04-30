@@ -86,18 +86,21 @@ fn friendly_path(p: &Path) -> String {
     p.display().to_string()
 }
 
+fn looks_like_path(s: &str) -> bool {
+    s == "." || s == ".." || s.contains('/')
+}
+
 /// Resolve a tag + mountpoint from the CLI target (path | tag | none).
 fn resolve(target: Option<String>) -> Result<(String, Option<PathBuf>)> {
     if let Some(t) = target.as_deref() {
-        let as_path = PathBuf::from(t);
-        if as_path.exists() && as_path.is_dir() {
+        if looks_like_path(t) {
+            let as_path = PathBuf::from(t);
             let canon = std::fs::canonicalize(&as_path).unwrap_or(as_path);
             let marker = read_marker_from(&canon).with_context(|| {
                 format!("no .smfs marker found at or above {}", canon.display())
             })?;
             return Ok((marker.tag, Some(canon)));
         }
-        // Not a path on disk — treat as tag.
         return Ok((t.to_string(), None));
     }
     let marker = super::marker::read_smfs_marker()

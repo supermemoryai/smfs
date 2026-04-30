@@ -1459,7 +1459,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smfs"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1467,6 +1467,7 @@ dependencies = [
  "libc",
  "serde_json",
  "smfs-core",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1474,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "smfs-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -5,7 +5,7 @@
 //! user's stored credentials and execs this subcommand with `--key`.
 //! It can also be used directly for scripting or debugging.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use std::path::PathBuf;
 
@@ -82,11 +82,8 @@ pub struct Args {
     #[arg(long, hide = true)]
     pub no_inject_hint: bool,
 
-    /// Import pre-existing files from the mount directory into the
-    /// Supermemory container. When the mount path already contains files,
-    /// this flag skips the interactive prompt and imports them automatically.
     #[arg(long)]
-    pub import_existing: bool,
+    pub no_import: bool,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -121,7 +118,7 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    let import_existing = args.import_existing || prompt_import_if_nonempty(&mount_path)?;
+    let import_existing = !args.no_import;
 
     if args.foreground {
         // Inline path — run the daemon body in this process. Ctrl-C / SIGTERM
@@ -199,8 +196,8 @@ pub async fn run(args: Args) -> Result<()> {
     if args.no_sync {
         cmd.arg("--no-sync");
     }
-    if import_existing {
-        cmd.arg("--import-existing");
+    if !import_existing {
+        cmd.arg("--no-import");
     }
     cmd.arg("--drain-timeout")
         .arg(args.drain_timeout.to_string());
@@ -319,42 +316,27 @@ fn friendly_path(p: &std::path::Path) -> String {
     p.display().to_string()
 }
 
-fn prompt_import_if_nonempty(mount_path: &std::path::Path) -> Result<bool> {
-    if !mount_path.is_dir() {
-        return Ok(false);
-    }
-    let has_files = std::fs::read_dir(mount_path)
-        .map(|mut rd| rd.next().is_some())
-        .unwrap_or(false);
-    if !has_files {
-        return Ok(false);
-    }
-
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
-        eprintln!(
-            "warning: mount path '{}' is not empty. \
-             Existing files will be hidden during mount. \
-             Use --import-existing to import them.",
-            mount_path.display(),
-        );
-        return Ok(false);
-    }
-
-    let count = count_files_recursive(mount_path);
-    eprintln!(
-        "warning: mount path '{}' contains {count} existing file(s).",
-        mount_path.display(),
-    );
-    eprintln!("These files will be hidden while the filesystem is mounted.");
-    eprint!("Import them into the Supermemory container? [y/N] ");
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    Ok(answer.trim().eq_ignore_ascii_case("y"))
+fn looks_like_path(s: &str) -> bool {
+    s == "." || s == ".." || s.contains('/')
 }
 
-fn looks_like_path(s: &str) -> bool {
-    s == "." || s == ".." || s.contains('/') || std::path::Path::new(s).is_dir()
+fn validate_tag(tag: &str) -> anyhow::Result<()> {
+    if tag.is_empty() {
+        anyhow::bail!("container tag cannot be empty");
+    }
+    if tag.len() > 100 {
+        anyhow::bail!("container tag must be 100 characters or less");
+    }
+    if let Some(bad) = tag
+        .chars()
+        .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | ':'))
+    {
+        anyhow::bail!(
+            "container tag '{tag}' contains unsupported character '{bad}'. \
+             Allowed: a-z A-Z 0-9 _ - :"
+        );
+    }
+    Ok(())
 }
 
 fn resolve_tag_and_path(
@@ -365,22 +347,181 @@ fn resolve_tag_and_path(
         if explicit_path.is_some() {
             anyhow::bail!("cannot use both a path as the tag and --path");
         }
-        let canon = std::fs::canonicalize(positional)
-            .unwrap_or_else(|_| std::path::PathBuf::from(positional));
+        let raw = std::path::Path::new(positional);
+        let canon = match std::fs::canonicalize(raw) {
+            Ok(p) => p,
+            Err(_) => {
+                let base = if raw.is_absolute() {
+                    raw.to_path_buf()
+                } else {
+                    std::env::current_dir()
+                        .context("cannot determine current directory")?
+                        .join(raw)
+                };
+                let mut normalized = std::path::PathBuf::new();
+                for component in base.components() {
+                    match component {
+                        std::path::Component::ParentDir => {
+                            normalized.pop();
+                        }
+                        std::path::Component::CurDir => {}
+                        c => normalized.push(c),
+                    }
+                }
+                normalized
+            }
+        };
         let tag = canon
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .ok_or_else(|| {
                 anyhow::anyhow!("cannot derive container tag from path '{positional}'")
             })?;
+        validate_tag(&tag)?;
         Ok((tag, canon))
     } else {
-        let mount_path = explicit_path.unwrap_or_else(|| {
-            std::env::current_dir()
-                .expect("cannot determine current directory")
-                .join(positional)
-        });
+        validate_tag(positional)?;
+        let mount_path = match explicit_path {
+            Some(p) => p,
+            None => std::env::current_dir()
+                .context("cannot determine current directory")?
+                .join(positional),
+        };
         Ok((positional.to_string(), mount_path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn looks_like_path_cases() {
+        assert!(looks_like_path("."));
+        assert!(looks_like_path(".."));
+        assert!(looks_like_path("./notes"));
+        assert!(looks_like_path("../sibling"));
+        assert!(looks_like_path("/absolute/path"));
+        assert!(looks_like_path("foo/bar"));
+
+        assert!(!looks_like_path("mytag"));
+        assert!(!looks_like_path("prod-notes"));
+        assert!(!looks_like_path("user_123"));
+        assert!(!looks_like_path("project:alpha"));
+    }
+
+    #[test]
+    fn looks_like_path_no_is_dir_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("mycontainer");
+        fs::create_dir(&dir).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        assert!(!looks_like_path("mycontainer"));
+        std::env::set_current_dir(prev).unwrap();
+    }
+
+    #[test]
+    fn resolve_tag_and_path_plain_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tag, path) = resolve_tag_and_path("mynotes", None).unwrap();
+        assert_eq!(tag, "mynotes");
+        assert!(path.is_absolute());
+        assert!(path.ends_with("mynotes"));
+        let _ = tmp;
+    }
+
+    #[test]
+    fn resolve_tag_and_path_explicit_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tag, path) = resolve_tag_and_path("mynotes", Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(tag, "mynotes");
+        assert_eq!(path, tmp.path());
+    }
+
+    #[test]
+    fn resolve_tag_and_path_dot() {
+        let cwd = std::env::current_dir().unwrap();
+        let expected_tag = cwd.file_name().unwrap().to_string_lossy().into_owned();
+        let (tag, path) = resolve_tag_and_path(".", None).unwrap();
+        assert_eq!(tag, expected_tag);
+        assert!(path.is_absolute());
+    }
+
+    #[test]
+    fn resolve_tag_and_path_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let named = tmp.path().join("mycontainer");
+        fs::create_dir(&named).unwrap();
+        let abs = named.to_str().unwrap();
+        let (tag, path) = resolve_tag_and_path(abs, None).unwrap();
+        assert_eq!(tag, "mycontainer");
+        assert!(path.is_absolute());
+    }
+
+    #[test]
+    fn resolve_tag_and_path_nonexistent_relative() {
+        let (tag, path) = resolve_tag_and_path("./newdir", None).unwrap();
+        assert_eq!(tag, "newdir");
+        assert!(path.is_absolute(), "path must be absolute even when dir doesn't exist: {path:?}");
+    }
+
+    #[test]
+    fn resolve_tag_and_path_dot_with_explicit_path_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = resolve_tag_and_path(".", Some(tmp.path().to_path_buf()));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn resolve_tag_and_path_existing_dir_named_as_tag_with_path_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tag_dir = tmp.path().join("mytag");
+        fs::create_dir(&tag_dir).unwrap();
+        let other = tmp.path().join("other");
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let (tag, path) = resolve_tag_and_path("mytag", Some(other.clone())).unwrap();
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(tag, "mytag");
+        assert_eq!(path, other);
+    }
+
+    #[test]
+    fn resolve_tag_and_path_root_errors() {
+        let err = resolve_tag_and_path("/", None);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn validate_tag_rejects_dot_in_path_component() {
+        let err = resolve_tag_and_path("./v1.2.3", None);
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("unsupported character"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_tag_rejects_space_in_path_component() {
+        let err = resolve_tag_and_path("/tmp/my project", None);
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("unsupported character"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_tag_rejects_plain_invalid_chars() {
+        for bad in &["my.tag", "my@tag", "foo!", "bar+baz"] {
+            let err = resolve_tag_and_path(bad, None);
+            assert!(err.is_err(), "expected error for tag '{bad}'");
+        }
+    }
+
+    #[test]
+    fn validate_tag_accepts_valid_chars() {
+        let (tag, _) = resolve_tag_and_path("my-tag_v2:prod", None).unwrap();
+        assert_eq!(tag, "my-tag_v2:prod");
     }
 }
 

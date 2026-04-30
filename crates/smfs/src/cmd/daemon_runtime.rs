@@ -45,7 +45,6 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         std::fs::create_dir_all(&cfg.mount_path)?;
     }
 
-    // Must scan before mounting -- the mount shadows pre-existing files.
     let pre_existing_files = if cfg.import_existing && !created_dir {
         let files = collect_files_recursive(&cfg.mount_path, &cfg.mount_path);
         if !files.is_empty() {
@@ -160,7 +159,6 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         }
     }
 
-    // Import after initial pull so we skip files already in the container.
     if !pre_existing_files.is_empty() {
         let mut imported = 0usize;
         let mut skipped = 0usize;
@@ -311,7 +309,6 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     Ok(())
 }
 
-/// Collect `(vfs_path, contents)` pairs from a directory tree.
 fn collect_files_recursive(
     dir: &std::path::Path,
     root: &std::path::Path,

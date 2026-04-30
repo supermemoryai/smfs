@@ -55,7 +55,7 @@ pub struct Args {
     pub drain_timeout: u64,
 
     #[arg(long, default_value_t = false)]
-    pub import_existing: bool,
+    pub no_import: bool,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -83,7 +83,7 @@ pub async fn run(args: Args) -> Result<()> {
         deletion_scan_interval: args.deletion_scan_interval,
         no_sync: args.no_sync,
         drain_timeout: args.drain_timeout,
-        import_existing: args.import_existing,
+        import_existing: !args.no_import,
     };
 
     daemon_runtime::run(cfg).await
