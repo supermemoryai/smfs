@@ -158,32 +158,42 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
 
     fs.warm_profile().await;
 
-    match smfs_core::sync::SyncEngine::initial_pull(&fs).await {
+    let pull_succeeded = match smfs_core::sync::SyncEngine::initial_pull(&fs).await {
         Ok((removed, reconciled)) => {
             eprintln!(
                 "initial sync: {reconciled} docs reconciled, {removed} stale entries removed"
             );
+            true
         }
         Err(e) => {
-            tracing::warn!(error = %e, "initial sync failed; mount will continue");
+            tracing::warn!(error = %e, "initial sync failed; mount will continue without auto-import");
+            false
         }
-    }
+    };
 
     if !pre_existing_files.is_empty() {
-        let mut imported = 0usize;
-        let mut skipped = 0usize;
-        let mut errors = 0usize;
-        for (rel_path, contents) in &pre_existing_files {
-            match fs.import_file(rel_path, contents).await {
-                Ok(true) => imported += 1,
-                Ok(false) => skipped += 1,
-                Err(e) => {
-                    tracing::warn!(path = %rel_path, error = %e, "import failed");
-                    errors += 1;
+        if !pull_succeeded {
+            eprintln!(
+                "skipping auto-import of {} file(s): initial sync failed, \
+                 cache cannot reliably detect duplicates. Remount when online to import.",
+                pre_existing_files.len()
+            );
+        } else {
+            let mut imported = 0usize;
+            let mut skipped = 0usize;
+            let mut errors = 0usize;
+            for (rel_path, contents) in &pre_existing_files {
+                match fs.import_file(rel_path, contents).await {
+                    Ok(true) => imported += 1,
+                    Ok(false) => skipped += 1,
+                    Err(e) => {
+                        tracing::warn!(path = %rel_path, error = %e, "import failed");
+                        errors += 1;
+                    }
                 }
             }
+            eprintln!("import: {imported} imported, {skipped} already existed, {errors} failed");
         }
-        eprintln!("import: {imported} imported, {skipped} already existed, {errors} failed");
     }
 
     // Sync engine: push always on, pull gated by --no-sync.
