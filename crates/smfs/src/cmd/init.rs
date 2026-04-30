@@ -23,9 +23,12 @@ grep() {
     _smfs_pwd_real="$(pwd -P)"
     while [ "$_smfs_dir" != "/" ]; do
         if [ -f "$_smfs_dir/.smfs" ]; then
-            _smfs_mp=$(command grep '^mount_path=' "$_smfs_dir/.smfs" 2>/dev/null | cut -d= -f2-)
-            _smfs_mp_real="$(cd "$_smfs_mp" 2>/dev/null && pwd -P)"
-            case "$_smfs_pwd_real" in "$_smfs_mp_real"|"$_smfs_mp_real"/*) _smfs_found=1 ;; esac
+            while IFS= read -r _smfs_mp; do
+                _smfs_mp_real="$(cd "$_smfs_mp" 2>/dev/null && pwd -P)"
+                case "$_smfs_pwd_real" in "$_smfs_mp_real"|"$_smfs_mp_real"/*) _smfs_found=1; break ;; esac
+            done <<_SMFS_A_EOF
+$(command grep '^mount_path=' "$_smfs_dir/.smfs" 2>/dev/null | cut -d= -f2-)
+_SMFS_A_EOF
             break
         fi
         _smfs_dir="$(dirname "$_smfs_dir")"
@@ -55,11 +58,14 @@ grep() {
             [ ! -d "$_smfs_dir" ] && _smfs_dir="$(dirname "$_smfs_dir")"
             while [ "$_smfs_dir" != "/" ]; do
                 if [ -f "$_smfs_dir/.smfs" ]; then
-                    _smfs_mp=$(command grep '^mount_path=' "$_smfs_dir/.smfs" 2>/dev/null | cut -d= -f2-)
-                    _smfs_mp_real="$(cd "$_smfs_mp" 2>/dev/null && pwd -P)"
-                    case "$_smfs_resolved" in
-                        "$_smfs_mp_real"|"$_smfs_mp_real"/*) _smfs_found=1; break 2 ;;
-                    esac
+                    while IFS= read -r _smfs_mp; do
+                        _smfs_mp_real="$(cd "$_smfs_mp" 2>/dev/null && pwd -P)"
+                        case "$_smfs_resolved" in
+                            "$_smfs_mp_real"|"$_smfs_mp_real"/*) _smfs_found=1; break 2 ;;
+                        esac
+                    done <<_SMFS_B_EOF
+$(command grep '^mount_path=' "$_smfs_dir/.smfs" 2>/dev/null | cut -d= -f2-)
+_SMFS_B_EOF
                     break
                 fi
                 _smfs_dir="$(dirname "$_smfs_dir")"

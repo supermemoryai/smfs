@@ -96,9 +96,10 @@ fn resolve(target: Option<String>) -> Result<(String, Option<PathBuf>)> {
         if looks_like_path(t) {
             let as_path = PathBuf::from(t);
             let canon = std::fs::canonicalize(&as_path).unwrap_or(as_path);
-            let marker = read_marker_from(&canon).with_context(|| {
-                format!("no .smfs marker found at or above {}", canon.display())
-            })?;
+            let marker = super::marker::read_smfs_marker_for_path(&canon)
+                .with_context(|| {
+                    format!("no .smfs marker found at or above {}", canon.display())
+                })?;
             return Ok((marker.tag, Some(canon)));
         }
         return Ok((t.to_string(), None));
@@ -107,39 +108,6 @@ fn resolve(target: Option<String>) -> Result<(String, Option<PathBuf>)> {
         .context("no target given and no .smfs marker found in cwd ancestors")?;
     let mp = marker.mount_path.as_deref().map(PathBuf::from);
     Ok((marker.tag, mp))
-}
-
-fn read_marker_from(start: &Path) -> Option<super::marker::SmfsMarker> {
-    let mut dir = start.to_path_buf();
-    loop {
-        let marker = dir.join(".smfs");
-        if marker.exists() {
-            let content = std::fs::read_to_string(&marker).ok()?;
-            let mut tag = None;
-            let mut api_url = None;
-            let mut mount_path = None;
-            for line in content.lines() {
-                if let Some(v) = line.strip_prefix("container_tag=") {
-                    tag = Some(v.to_string());
-                }
-                if let Some(v) = line.strip_prefix("api_url=") {
-                    api_url = Some(v.to_string());
-                }
-                if let Some(v) = line.strip_prefix("mount_path=") {
-                    mount_path = Some(v.to_string());
-                }
-            }
-            return Some(super::marker::SmfsMarker {
-                tag: tag?,
-                api_url: api_url.unwrap_or_else(|| "https://api.supermemory.ai".to_string()),
-                mount_path,
-            });
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    None
 }
 
 fn force_umount(path: &Path) {

@@ -64,15 +64,24 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         .parent()
         .unwrap_or(&cfg.mount_path)
         .join(".smfs");
-    std::fs::write(
-        &marker_path,
-        format!(
-            "container_tag={}\napi_url={}\nmount_path={}\n",
-            cfg.container_tag,
-            cfg.api_url,
-            cfg.mount_path.display(),
-        ),
-    )?;
+    {
+        use super::marker::{format_marker, parse_all_markers, SmfsMarker};
+        let new_entry = SmfsMarker {
+            tag: cfg.container_tag.clone(),
+            api_url: cfg.api_url.clone(),
+            mount_path: Some(cfg.mount_path.display().to_string()),
+        };
+        let content = if marker_path.exists() {
+            let existing = std::fs::read_to_string(&marker_path).unwrap_or_default();
+            let mut entries = parse_all_markers(&existing);
+            entries.retain(|m| m.tag != cfg.container_tag);
+            entries.push(new_entry);
+            entries.iter().map(format_marker).collect::<Vec<_>>().join("\n")
+        } else {
+            format_marker(&new_entry)
+        };
+        std::fs::write(&marker_path, content)?;
+    }
 
     let opts = MountOpts::new(cfg.mount_path.clone(), cfg.backend).with_ownership(uid, gid);
 
@@ -300,7 +309,23 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             .output();
     }
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let _ = std::fs::remove_file(&marker_path);
+    {
+        use super::marker::{format_marker, parse_all_markers};
+        if let Ok(existing) = std::fs::read_to_string(&marker_path) {
+            let remaining: Vec<_> = parse_all_markers(&existing)
+                .into_iter()
+                .filter(|m| m.tag != cfg.container_tag)
+                .collect();
+            if remaining.is_empty() {
+                let _ = std::fs::remove_file(&marker_path);
+            } else {
+                let out = remaining.iter().map(format_marker).collect::<Vec<_>>().join("\n");
+                let _ = std::fs::write(&marker_path, out);
+            }
+        } else {
+            let _ = std::fs::remove_file(&marker_path);
+        }
+    }
     let _ = std::fs::remove_file(&pid_path);
     let _ = std::fs::remove_file(&socket_path);
     if created_dir {
