@@ -114,7 +114,6 @@ pub async fn run(args: Args) -> Result<()> {
         eprintln!("# usage:");
         eprintln!("#   grep \"natural language query\"         search by meaning, all files");
         eprintln!("#   grep \"query\" path/to/dir/             scope to a directory");
-        eprintln!("#   grep -F \"exact string\" path/to/file   exact match (bypasses semantic)");
         return Ok(());
     }
 
@@ -219,7 +218,6 @@ pub async fn run(args: Args) -> Result<()> {
             args.query
         );
         eprintln!("# this searches by meaning, not exact text. try a natural language query.");
-        eprintln!("# for exact string matching: grep -F \"pattern\" <path>");
         return Ok(());
     }
 
@@ -232,9 +230,6 @@ pub async fn run(args: Args) -> Result<()> {
     eprintln!("# searches by meaning across files in this container. usage:");
     eprintln!("#   grep \"natural language query\"          search all files");
     eprintln!("#   grep \"query\" path/to/dir/              search within directory");
-    eprintln!(
-        "#   grep -F \"exact string\" path/to/dir/    exact match (bypasses semantic search)"
-    );
     eprintln!();
 
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
