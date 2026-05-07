@@ -403,11 +403,11 @@ impl StartupDisplay {
         let loaded = self.displayed_loaded.floor() as usize;
         if let Some(total) = self.total {
             let display_total = total.max(loaded);
-            let pct = if display_total > 0 {
-                (loaded.saturating_mul(100) / display_total).min(100)
-            } else {
-                0
-            };
+            let pct = loaded
+                .saturating_mul(100)
+                .checked_div(display_total)
+                .unwrap_or(0)
+                .min(100);
             if self.rate > 0.0 {
                 format!(
                     "syncing {}: {} / {} files loaded ({}%, {:.0} files/s)",
