@@ -243,8 +243,11 @@ pub async fn run(args: Args) -> Result<()> {
             }
         }
         if let Some((body, progress)) = super::startup::read_progress(&container_tag) {
-            display.observe_progress(&progress, Instant::now());
-            wait_state.observe_progress(body, progress, Instant::now());
+            let now = Instant::now();
+            if progress.pid == child_pid {
+                display.observe_progress(&progress, now);
+            }
+            wait_state.observe_progress(body, progress, now, child_pid);
         }
         display.tick(Instant::now());
         if wait_state.timed_out(Instant::now()) {
@@ -387,33 +390,38 @@ impl StartupDisplay {
     }
 
     fn render(&mut self, newline: bool) {
-        let loaded = self.displayed_loaded.floor() as usize;
-        let line = if let Some(total) = self.total {
-            let pct = if total > 0 {
-                loaded.saturating_mul(100) / total
-            } else {
-                0
-            };
-            if self.rate > 0.0 {
-                format!(
-                    "syncing {}: {} / {} files loaded ({}%, {:.0} files/s)",
-                    self.tag, loaded, total, pct, self.rate
-                )
-            } else {
-                format!(
-                    "syncing {}: {} / {} files loaded ({}%)",
-                    self.tag, loaded, total, pct
-                )
-            }
-        } else {
-            format!("syncing {}: {} files loaded", self.tag, loaded)
-        };
+        let line = self.render_line();
         eprint!("\r{line}\x1b[K");
         if newline {
             eprintln!();
         }
         let _ = std::io::stderr().flush();
         self.rendered = true;
+    }
+
+    fn render_line(&self) -> String {
+        let loaded = self.displayed_loaded.floor() as usize;
+        if let Some(total) = self.total {
+            let display_total = total.max(loaded);
+            let pct = if display_total > 0 {
+                (loaded.saturating_mul(100) / display_total).min(100)
+            } else {
+                0
+            };
+            if self.rate > 0.0 {
+                format!(
+                    "syncing {}: {} / {} files loaded ({}%, {:.0} files/s)",
+                    self.tag, loaded, display_total, pct, self.rate
+                )
+            } else {
+                format!(
+                    "syncing {}: {} / {} files loaded ({}%)",
+                    self.tag, loaded, display_total, pct
+                )
+            }
+        } else {
+            format!("syncing {}: {} files loaded", self.tag, loaded)
+        }
     }
 }
 
@@ -440,7 +448,11 @@ impl StartupWaitState {
         body: String,
         progress: super::startup::StartupProgress,
         now: Instant,
+        expected_pid: u32,
     ) {
+        if progress.pid != expected_pid {
+            return;
+        }
         if self.last_progress_body.as_deref() != Some(body.as_str()) {
             self.last_activity = now;
             self.last_progress_body = Some(body);
@@ -766,6 +778,7 @@ mod tests {
                 total: None,
             },
             now + Duration::from_secs(25),
+            42,
         );
 
         assert!(!state.timed_out(now + Duration::from_secs(54)));
@@ -793,13 +806,52 @@ mod tests {
             "{\"seq\":1}".to_string(),
             progress.clone(),
             now + Duration::from_secs(10),
+            42,
         );
         state.observe_progress(
             "{\"seq\":1}".to_string(),
             progress,
             now + Duration::from_secs(35),
+            42,
         );
 
         assert!(state.timed_out(now + Duration::from_secs(40)));
+    }
+
+    #[test]
+    fn startup_wait_ignores_progress_from_other_pid() {
+        let now = Instant::now();
+        let mut state = StartupWaitState::new(Duration::from_secs(30), now);
+
+        state.observe_progress(
+            "{\"seq\":1}".to_string(),
+            crate::cmd::startup::StartupProgress {
+                pid: 7,
+                seq: 1,
+                phase: "initial_sync".to_string(),
+                message: "reconciled 100 docs".to_string(),
+                loaded: Some(100),
+                total: Some(1000),
+            },
+            now + Duration::from_secs(25),
+            42,
+        );
+
+        assert!(state.timed_out(now + Duration::from_secs(30)));
+        assert!(state.last_progress_summary().is_none());
+    }
+
+    #[test]
+    fn startup_display_clamps_percent_and_total() {
+        let mut display = StartupDisplay::new("eval");
+        display.enabled = true;
+        display.displayed_loaded = 120.0;
+        display.target_loaded = 120;
+        display.total = Some(100);
+
+        assert_eq!(
+            display.render_line(),
+            "syncing eval: 120 / 120 files loaded (100%)"
+        );
     }
 }
