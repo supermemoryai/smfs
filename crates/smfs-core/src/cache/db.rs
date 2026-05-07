@@ -619,6 +619,13 @@ impl Db {
         }
     }
 
+    pub(crate) fn remote_count(&self) -> usize {
+        let conn = self.conn.lock();
+        conn.query_row("SELECT COUNT(*) FROM fs_remote", [], |r| r.get::<_, i64>(0))
+            .unwrap_or(0)
+            .max(0) as usize
+    }
+
     /// Rows currently inflight — drives the inflight status poller.
     #[allow(dead_code)] // kept for future deep diagnostics
     pub(crate) fn push_queue_inflight(&self) -> Vec<InflightRow> {

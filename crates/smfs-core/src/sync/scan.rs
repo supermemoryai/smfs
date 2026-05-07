@@ -8,10 +8,35 @@ use crate::cache::SupermemoryFs;
 
 const PAGE_SIZE: u32 = 100;
 
+#[derive(Debug, Clone, Copy)]
+pub struct DeletionScanProgress {
+    pub page: u32,
+    pub total_pages: u32,
+    pub total_items: usize,
+    pub remote_seen: usize,
+}
+
 /// Run one deletion-scan pass. Returns `Ok(removed)` where `removed` is the
 /// number of local inodes that were unlinked because their remote_id
 /// disappeared from the server.
 pub async fn deletion_scan(fs: &Arc<SupermemoryFs>) -> anyhow::Result<usize> {
+    deletion_scan_inner(fs, None).await
+}
+
+pub async fn deletion_scan_with_progress<F>(
+    fs: &Arc<SupermemoryFs>,
+    mut on_progress: F,
+) -> anyhow::Result<usize>
+where
+    F: FnMut(DeletionScanProgress) + Send,
+{
+    deletion_scan_inner(fs, Some(&mut on_progress)).await
+}
+
+async fn deletion_scan_inner(
+    fs: &Arc<SupermemoryFs>,
+    mut on_progress: Option<&mut (dyn FnMut(DeletionScanProgress) + Send)>,
+) -> anyhow::Result<usize> {
     let Some(api) = fs.api() else {
         return Ok(0);
     };
@@ -37,6 +62,14 @@ pub async fn deletion_scan(fs: &Arc<SupermemoryFs>) -> anyhow::Result<usize> {
         }
         for d in &resp.memories {
             remote_ids.insert(d.id.clone());
+        }
+        if let Some(cb) = on_progress.as_mut() {
+            cb(DeletionScanProgress {
+                page,
+                total_pages: resp.pagination.total_pages,
+                total_items: resp.pagination.total_items as usize,
+                remote_seen: remote_ids.len(),
+            });
         }
         if page >= resp.pagination.total_pages {
             break;

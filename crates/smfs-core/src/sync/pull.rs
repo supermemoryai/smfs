@@ -16,6 +16,14 @@ const SYNC_META_LAST_SEEN: &str = "last_seen_updated_at";
 /// Per-file cap on R2 rehydration fetch (larger files stay 0-byte stubs).
 const REHYDRATE_SIZE_CAP: u64 = 20 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy)]
+pub struct PullProgress {
+    pub page: u32,
+    pub total_pages: u32,
+    pub total_items: usize,
+    pub reconciled: usize,
+}
+
 /// Run one pass of the delta pull loop. Returns the number of remote docs
 /// that were reconciled this pass (whether or not they produced local
 /// changes).
@@ -88,6 +96,23 @@ async fn list_page(api: &ApiClient, page: u32) -> anyhow::Result<ListDocumentsRe
 /// Full pull (no watermark). Used on mount when we have no prior state — we
 /// want to catch every remote doc regardless of `updatedAt`.
 pub async fn full_pull(fs: &Arc<SupermemoryFs>) -> anyhow::Result<usize> {
+    full_pull_inner(fs, None).await
+}
+
+pub async fn full_pull_with_progress<F>(
+    fs: &Arc<SupermemoryFs>,
+    mut on_progress: F,
+) -> anyhow::Result<usize>
+where
+    F: FnMut(PullProgress) + Send,
+{
+    full_pull_inner(fs, Some(&mut on_progress)).await
+}
+
+async fn full_pull_inner(
+    fs: &Arc<SupermemoryFs>,
+    mut on_progress: Option<&mut (dyn FnMut(PullProgress) + Send)>,
+) -> anyhow::Result<usize> {
     let Some(api) = fs.api() else {
         return Ok(0);
     };
@@ -109,6 +134,14 @@ pub async fn full_pull(fs: &Arc<SupermemoryFs>) -> anyhow::Result<usize> {
             reconciled += 1;
             if doc.updated_at > newest_seen {
                 newest_seen = doc.updated_at.clone();
+            }
+            if let Some(cb) = on_progress.as_mut() {
+                cb(PullProgress {
+                    page,
+                    total_pages: resp.pagination.total_pages,
+                    total_items: resp.pagination.total_items as usize,
+                    reconciled,
+                });
             }
         }
         if page >= resp.pagination.total_pages {

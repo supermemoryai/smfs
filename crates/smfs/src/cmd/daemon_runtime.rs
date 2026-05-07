@@ -15,6 +15,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use tokio::sync::Notify;
 
+use super::startup::StartupReporter;
 use smfs_core::cache::{Db, SupermemoryFs};
 use smfs_core::daemon;
 use smfs_core::mount::{mount_fs, MountBackend, MountOpts};
@@ -40,6 +41,9 @@ pub struct DaemonConfig {
 }
 
 pub async fn run(cfg: DaemonConfig) -> Result<()> {
+    let mut startup = StartupReporter::new(&cfg.container_tag);
+    startup.report("creating_mountpoint", "preparing mountpoint")?;
+
     let created_dir = !cfg.mount_path.exists();
     if created_dir {
         std::fs::create_dir_all(&cfg.mount_path)?;
@@ -89,6 +93,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
 
     let opts = MountOpts::new(cfg.mount_path.clone(), cfg.backend).with_ownership(uid, gid);
 
+    startup.report("validating_key", "validating API key")?;
     let session = if cfg.ephemeral {
         smfs_core::api::ApiClient::validate_key(&cfg.api_url, &cfg.api_key)
             .await
@@ -113,6 +118,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
                     "server did not return org id; cannot open cache. Run `smfs login` and retry."
                 )
             })?;
+        startup.report("opening_cache", format!("opening cache for org {org_id}"))?;
         let db_path = smfs_core::config::cache_db_path(org_id, &cfg.container_tag);
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -132,6 +138,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         Arc::new(Db::open(&db_path)?)
     };
 
+    startup.report("configuring_api", "configuring API client")?;
     let mut api_client =
         smfs_core::api::ApiClient::new(&cfg.api_url, &cfg.api_key, &cfg.container_tag);
     if let Some(uid) = session.as_ref().and_then(|s| s.user_id.clone()) {
@@ -156,9 +163,43 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
 
     let fs = Arc::new(SupermemoryFs::with_api(db, api));
 
+    startup.report("warming_profile", "warming profile")?;
     fs.warm_profile().await;
 
-    let pull_succeeded = match smfs_core::sync::SyncEngine::initial_pull(&fs).await {
+    startup.report("initial_sync", "starting initial sync")?;
+    let pull_succeeded = match smfs_core::sync::SyncEngine::initial_pull_with_progress(
+        &fs,
+        |progress| match progress {
+            smfs_core::sync::InitialPullProgress::DeletionScan(progress) => {
+                if progress.remote_seen == 1 || progress.remote_seen % 100 == 0 {
+                    let _ = startup.report_counts(
+                        "initial_sync",
+                        format!(
+                            "deletion scan saw {} remote docs (page {}/{})",
+                            progress.remote_seen, progress.page, progress.total_pages
+                        ),
+                        progress.remote_seen,
+                        progress.total_items,
+                    );
+                }
+            }
+            smfs_core::sync::InitialPullProgress::Pull(progress) => {
+                if progress.reconciled == 1 || progress.reconciled % 100 == 0 {
+                    let _ = startup.report_counts(
+                        "initial_sync",
+                        format!(
+                            "reconciled {} docs (page {}/{})",
+                            progress.reconciled, progress.page, progress.total_pages
+                        ),
+                        progress.reconciled,
+                        progress.total_items,
+                    );
+                }
+            }
+        },
+    )
+    .await
+    {
         Ok((removed, reconciled)) => {
             eprintln!(
                 "initial sync: {reconciled} docs reconciled, {removed} stale entries removed"
@@ -205,6 +246,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     };
     let sync_tasks = smfs_core::sync::SyncEngine::start(fs.clone(), sync_opts, shutdown_rx.clone());
 
+    startup.report("mounting_fs", "mounting filesystem")?;
     let handle = mount_fs(fs.clone(), opts).await?;
 
     // Auto-install grep wrapper on first mount.
@@ -215,6 +257,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     }
 
     // Bring up the IPC control socket. Clients use it for status/sync/unmount.
+    startup.report("starting_ipc", "starting IPC socket")?;
     daemon::ensure_dirs().context("creating daemon state dirs")?;
     let ipc_shutdown_notify = Arc::new(Notify::new());
     let state = Arc::new(smfs_core::daemon::ipc::IpcState {
@@ -244,6 +287,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&pid_path, std::process::id().to_string())?;
+    startup.report("ready", "filesystem mounted and IPC ready")?;
 
     eprintln!(
         "supermemoryfs mounted at {} (backend: {}, tag: {})",
@@ -340,6 +384,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     }
     let _ = std::fs::remove_file(&pid_path);
     let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(daemon::startup_path(&cfg.container_tag));
     if created_dir {
         let _ = std::fs::remove_dir(&cfg.mount_path);
     }

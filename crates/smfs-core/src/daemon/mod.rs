@@ -33,6 +33,9 @@ pub fn pids_dir() -> PathBuf {
 pub fn logs_dir() -> PathBuf {
     cache_dir().join("logs")
 }
+pub fn startup_dir() -> PathBuf {
+    cache_dir().join("startup")
+}
 
 pub fn socket_path(tag: &str) -> PathBuf {
     sockets_dir().join(format!("{tag}.sock"))
@@ -43,12 +46,16 @@ pub fn pid_path(tag: &str) -> PathBuf {
 pub fn log_path(tag: &str) -> PathBuf {
     logs_dir().join(format!("{tag}.log"))
 }
+pub fn startup_path(tag: &str) -> PathBuf {
+    startup_dir().join(format!("{tag}.json"))
+}
 
 /// Create `sockets/`, `pids/`, `logs/` subdirectories if missing.
 pub fn ensure_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(sockets_dir())?;
     std::fs::create_dir_all(pids_dir())?;
     std::fs::create_dir_all(logs_dir())?;
+    std::fs::create_dir_all(startup_dir())?;
     Ok(())
 }
 
@@ -83,10 +90,12 @@ pub fn cleanup_stale(tag: &str) -> bool {
         Some(pid) if !pid_alive(pid) => {
             let _ = std::fs::remove_file(pid_path(tag));
             let _ = std::fs::remove_file(socket_path(tag));
+            let _ = std::fs::remove_file(startup_path(tag));
             cleaned = true;
         }
         None if socket_path(tag).exists() => {
             let _ = std::fs::remove_file(socket_path(tag));
+            let _ = std::fs::remove_file(startup_path(tag));
             cleaned = true;
         }
         _ => {}

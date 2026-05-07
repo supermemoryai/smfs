@@ -1465,6 +1465,7 @@ dependencies = [
  "clap",
  "directories",
  "libc",
+ "serde",
  "serde_json",
  "smfs-core",
  "tempfile",

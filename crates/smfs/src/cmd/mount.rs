@@ -7,7 +7,11 @@
 
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+const DEFAULT_STARTUP_INACTIVITY_TIMEOUT_SECS: u64 = 30;
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
@@ -76,6 +80,9 @@ pub struct Args {
     /// mount. Default 30s.
     #[arg(long, default_value_t = 30)]
     pub drain_timeout: u64,
+
+    #[arg(long, default_value_t = DEFAULT_STARTUP_INACTIVITY_TIMEOUT_SECS)]
+    pub startup_timeout: u64,
 
     /// Internal: skip injecting the path-scoped agent hint. Used for
     /// baseline measurement; not part of the supported user surface.
@@ -156,6 +163,8 @@ pub async fn run(args: Args) -> Result<()> {
     // Clean any leftover socket/pid from a prior crash.
     smfs_core::daemon::cleanup_stale(&container_tag);
     smfs_core::daemon::ensure_dirs()?;
+    let startup_path = smfs_core::daemon::startup_path(&container_tag);
+    let _ = std::fs::remove_file(&startup_path);
 
     // Open the per-tag log file for the child's stdout/stderr. Parent
     // handoff: the daemon never writes to the controlling TTY again.
@@ -205,13 +214,15 @@ pub async fn run(args: Args) -> Result<()> {
         .stdout(log_file)
         .stderr(log_file_err);
 
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
     let child_pid = child.id();
     // The child will self-install a session via setsid; parent just waits
     // until the child's IPC socket comes up, then exits.
 
     let socket = smfs_core::daemon::socket_path(&container_tag);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let startup_timeout = Duration::from_secs(args.startup_timeout);
+    let mut wait_state = StartupWaitState::new(startup_timeout, Instant::now());
+    let mut display = StartupDisplay::new(&container_tag);
     let mut last_err: Option<String> = None;
     loop {
         // Ping the daemon — once it responds, we know the mount is live.
@@ -231,23 +242,40 @@ pub async fn run(args: Args) -> Result<()> {
                 }
             }
         }
-        if std::time::Instant::now() >= deadline {
+        if let Some((body, progress)) = super::startup::read_progress(&container_tag) {
+            display.observe_progress(&progress, Instant::now());
+            wait_state.observe_progress(body, progress, Instant::now());
+        }
+        display.tick(Instant::now());
+        if wait_state.timed_out(Instant::now()) {
+            display.finish();
+            let _ = child.kill();
+            let _ = child.wait();
+            let last_progress = wait_state
+                .last_progress_summary()
+                .unwrap_or_else(|| "<none>".to_string());
             anyhow::bail!(
-                "daemon did not become ready within 30s (pid {}). Log: {}\nLast error: {}",
+                "daemon made no startup progress for {}s before becoming ready (pid {}). Log: {}\nLast progress: {}\nLast error: {}",
+                args.startup_timeout,
                 child_pid,
                 log_path.display(),
+                last_progress,
                 last_err.unwrap_or_else(|| "<none>".into()),
             );
         }
         // Did the child die early?
-        if !smfs_core::daemon::pid_alive(child_pid) {
+        if let Some(status) = child.try_wait()? {
             anyhow::bail!(
-                "daemon exited before becoming ready. Log: {}",
-                log_path.display()
+                "daemon exited before becoming ready (status: {}). Log: {}",
+                status,
+                log_path.display(),
             );
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
+
+    display.finish();
+    let _ = std::fs::remove_file(&startup_path);
 
     eprintln!(
         "supermemoryfs mounted at {} (tag: {}, pid: {})",
@@ -263,6 +291,176 @@ pub async fn run(args: Args) -> Result<()> {
     install_hint_best_effort(&container_tag, &mount_path, args.no_inject_hint);
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct StartupDisplay {
+    tag: String,
+    enabled: bool,
+    target_loaded: usize,
+    total: Option<usize>,
+    displayed_loaded: f64,
+    last_target_loaded: usize,
+    last_target_at: Instant,
+    last_tick: Instant,
+    rate: f64,
+    rendered: bool,
+}
+
+impl StartupDisplay {
+    fn new(tag: &str) -> Self {
+        let now = Instant::now();
+        Self {
+            tag: tag.to_string(),
+            enabled: std::io::stderr().is_terminal(),
+            target_loaded: 0,
+            total: None,
+            displayed_loaded: 0.0,
+            last_target_loaded: 0,
+            last_target_at: now,
+            last_tick: now,
+            rate: 0.0,
+            rendered: false,
+        }
+    }
+
+    fn observe_progress(&mut self, progress: &super::startup::StartupProgress, now: Instant) {
+        let Some(loaded) = progress.loaded else {
+            return;
+        };
+        if loaded < self.target_loaded {
+            return;
+        }
+        if let Some(total) = progress.total {
+            if total > 0 {
+                self.total = Some(total);
+            }
+        }
+        if loaded > self.last_target_loaded {
+            let elapsed = now.duration_since(self.last_target_at).as_secs_f64();
+            if elapsed > 0.0 {
+                let instant_rate = (loaded - self.last_target_loaded) as f64 / elapsed;
+                self.rate = if self.rate > 0.0 {
+                    (self.rate * 0.7) + (instant_rate * 0.3)
+                } else {
+                    instant_rate
+                };
+            }
+            self.last_target_loaded = loaded;
+            self.last_target_at = now;
+        }
+        self.target_loaded = loaded;
+    }
+
+    fn tick(&mut self, now: Instant) {
+        if !self.enabled || self.target_loaded == 0 {
+            self.last_tick = now;
+            return;
+        }
+        if self.displayed_loaded >= self.target_loaded as f64 {
+            self.last_tick = now;
+            return;
+        }
+        let elapsed = now.duration_since(self.last_tick).as_secs_f64();
+        self.last_tick = now;
+        let speed = (self.rate * 0.85).clamp(25.0, 1200.0);
+        let next =
+            (self.displayed_loaded + (speed * elapsed).max(1.0)).min(self.target_loaded as f64);
+        if next.floor() as usize != self.displayed_loaded.floor() as usize {
+            self.displayed_loaded = next;
+            self.render(false);
+        } else {
+            self.displayed_loaded = next;
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        if self.target_loaded > 0 {
+            self.displayed_loaded = self.target_loaded as f64;
+            self.render(true);
+        } else if self.rendered {
+            eprintln!();
+        }
+    }
+
+    fn render(&mut self, newline: bool) {
+        let loaded = self.displayed_loaded.floor() as usize;
+        let line = if let Some(total) = self.total {
+            let pct = if total > 0 {
+                loaded.saturating_mul(100) / total
+            } else {
+                0
+            };
+            if self.rate > 0.0 {
+                format!(
+                    "syncing {}: {} / {} files loaded ({}%, {:.0} files/s)",
+                    self.tag, loaded, total, pct, self.rate
+                )
+            } else {
+                format!(
+                    "syncing {}: {} / {} files loaded ({}%)",
+                    self.tag, loaded, total, pct
+                )
+            }
+        } else {
+            format!("syncing {}: {} files loaded", self.tag, loaded)
+        };
+        eprint!("\r{line}\x1b[K");
+        if newline {
+            eprintln!();
+        }
+        let _ = std::io::stderr().flush();
+        self.rendered = true;
+    }
+}
+
+#[derive(Debug)]
+struct StartupWaitState {
+    inactivity_timeout: Duration,
+    last_activity: Instant,
+    last_progress_body: Option<String>,
+    last_progress: Option<super::startup::StartupProgress>,
+}
+
+impl StartupWaitState {
+    fn new(inactivity_timeout: Duration, now: Instant) -> Self {
+        Self {
+            inactivity_timeout,
+            last_activity: now,
+            last_progress_body: None,
+            last_progress: None,
+        }
+    }
+
+    fn observe_progress(
+        &mut self,
+        body: String,
+        progress: super::startup::StartupProgress,
+        now: Instant,
+    ) {
+        if self.last_progress_body.as_deref() != Some(body.as_str()) {
+            self.last_activity = now;
+            self.last_progress_body = Some(body);
+            self.last_progress = Some(progress);
+        }
+    }
+
+    fn timed_out(&self, now: Instant) -> bool {
+        now.duration_since(self.last_activity) >= self.inactivity_timeout
+    }
+
+    fn last_progress_summary(&self) -> Option<String> {
+        self.last_progress.as_ref().map(|p| {
+            if p.message.is_empty() {
+                format!("seq={} phase={}", p.seq, p.phase)
+            } else {
+                format!("seq={} phase={} message={}", p.seq, p.phase, p.message)
+            }
+        })
+    }
 }
 
 /// Sweep stale hints + install the new one. Logs to stderr; never fails the
@@ -541,5 +739,67 @@ mod tests {
     fn validate_tag_accepts_valid_chars() {
         let (tag, _) = resolve_tag_and_path("my-tag_v2:prod", None).unwrap();
         assert_eq!(tag, "my-tag_v2:prod");
+    }
+
+    #[test]
+    fn startup_wait_times_out_without_progress() {
+        let now = Instant::now();
+        let state = StartupWaitState::new(Duration::from_secs(30), now);
+
+        assert!(!state.timed_out(now + Duration::from_secs(29)));
+        assert!(state.timed_out(now + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn startup_wait_progress_resets_inactivity_timer() {
+        let now = Instant::now();
+        let mut state = StartupWaitState::new(Duration::from_secs(30), now);
+
+        state.observe_progress(
+            "{\"seq\":1}".to_string(),
+            crate::cmd::startup::StartupProgress {
+                pid: 42,
+                seq: 1,
+                phase: "validating_key".to_string(),
+                message: "validating API key".to_string(),
+                loaded: None,
+                total: None,
+            },
+            now + Duration::from_secs(25),
+        );
+
+        assert!(!state.timed_out(now + Duration::from_secs(54)));
+        assert!(state.timed_out(now + Duration::from_secs(55)));
+        assert_eq!(
+            state.last_progress_summary().as_deref(),
+            Some("seq=1 phase=validating_key message=validating API key")
+        );
+    }
+
+    #[test]
+    fn startup_wait_identical_progress_does_not_reset_timer() {
+        let now = Instant::now();
+        let mut state = StartupWaitState::new(Duration::from_secs(30), now);
+        let progress = crate::cmd::startup::StartupProgress {
+            pid: 42,
+            seq: 1,
+            phase: "opening_cache".to_string(),
+            message: "opening cache".to_string(),
+            loaded: None,
+            total: None,
+        };
+
+        state.observe_progress(
+            "{\"seq\":1}".to_string(),
+            progress.clone(),
+            now + Duration::from_secs(10),
+        );
+        state.observe_progress(
+            "{\"seq\":1}".to_string(),
+            progress,
+            now + Duration::from_secs(35),
+        );
+
+        assert!(state.timed_out(now + Duration::from_secs(40)));
     }
 }
