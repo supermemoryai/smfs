@@ -2,24 +2,23 @@ from __future__ import annotations
 
 import fnmatch
 import re
-from dataclasses import dataclass, field
-from typing import Callable, Awaitable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from ._errors import FsError
 from ._parse import (
-    Redirect,
     UnsupportedSyntaxError,
+    expand_word_async,
+    expand_words_async,
+    extract_assignments_async,
+    extract_redirects_async,
     parse_command,
-    expand_word,
-    expand_words,
-    extract_redirects,
-    extract_assignments,
 )
 from ._vendor.just_bash.ast.types import (
-    SimpleCommandNode,
     PipelineNode,
-    StatementNode,
     ScriptNode,
+    SimpleCommandNode,
+    StatementNode,
 )
 from ._volume import SupermemoryVolume
 
@@ -156,7 +155,11 @@ class Shell:
                 exit_code=2,
             )
 
-        assigns = extract_assignments(node.assignments, self.env)
+        assigns = await extract_assignments_async(
+            node.assignments,
+            self.env,
+            self._run_command_substitution,
+        )
         for k, v in assigns.items():
             self.env[k] = v
 
@@ -164,9 +167,13 @@ class Shell:
             return ExecResult()
 
         try:
-            name = expand_word(node.name, self.env)
-            args = expand_words(node.args, self.env)
-            redirects = extract_redirects(node.redirections, self.env)
+            name = await expand_word_async(node.name, self.env, self._run_command_substitution)
+            args = await expand_words_async(node.args, self.env, self._run_command_substitution)
+            redirects = await extract_redirects_async(
+                node.redirections,
+                self.env,
+                self._run_command_substitution,
+            )
         except UnsupportedSyntaxError as e:
             return ExecResult(stderr=f"{e}\n", exit_code=2)
 
@@ -195,7 +202,7 @@ class Shell:
             if redir.content or redir.op == "<":
                 continue
 
-            path = self._resolve(redir.path) if redir.path else None
+            path: str | None = self._resolve(redir.path) if redir.path else None
 
             if path == "/dev/null":
                 if redir.fd == 1:
@@ -227,6 +234,10 @@ class Shell:
                     result.stderr = ""
 
         return result
+
+    async def _run_command_substitution(self, script: ScriptNode) -> str:
+        result = await self._exec_script(script)
+        return result.stdout
 
     # ------------------------------------------------------------------
     # Built-in commands
@@ -835,7 +846,11 @@ class Shell:
         prefix = base_path if base_path.endswith("/") else f"{base_path}/"
         summaries = await self.volume.list_by_prefix(prefix)
 
-        results: list[str] = [base_path]
+        results: list[str] = []
+        if type_filter != "f":
+            base_name = base_path.rsplit("/", 1)[-1] or "/"
+            if name_pattern is None or fnmatch.fnmatch(base_name, name_pattern):
+                results.append(base_path)
         seen_dirs: set[str] = set()
         for s in summaries:
             rest = s.filepath[len(prefix):]
