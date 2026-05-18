@@ -191,9 +191,13 @@ async fn process_job(fs: &Arc<SupermemoryFs>, job: crate::cache::db::PushJob) {
                         tracing::debug!(filepath = %job.filepath, remote_id, "push: PATCH ok");
                         // Block until the PATCH's reprocessing settles, so
                         // the next coalesced write sees a `done` doc.
-                        wait_until_done(api, remote_id, WAIT_DONE_MAX).await;
-                        db.set_mirrored_state(ino, None, Some("done"), Some(now_ms()));
-                        db.set_dirty_since(ino, None);
+                        let done = wait_until_done(api, remote_id, WAIT_DONE_MAX).await;
+                        if done {
+                            db.set_mirrored_state(ino, None, Some("done"), Some(now_ms()));
+                        } else {
+                            tracing::warn!(filepath = %job.filepath, remote_id, "push: wait_until_done timed out after PATCH; deferring status to poller");
+                        }
+                        db.clear_dirty_since_if_unchanged(ino, job.dirty_since_at_claim);
                         db.push_queue_finalize_success(&job.filepath, now_ms());
                         db.push_notify().notify_one();
                     }
@@ -225,9 +229,13 @@ async fn process_job(fs: &Arc<SupermemoryFs>, job: crate::cache::db::PushJob) {
                         db.push_queue_set_remote_id(&job.filepath, &resp.id);
                         // Wait for this POST's pipeline to reach `done` so
                         // a coalesced follow-up PATCH lands cleanly.
-                        wait_until_done(api, &resp.id, WAIT_DONE_MAX).await;
-                        db.set_mirrored_state(ino, None, Some("done"), Some(now_ms()));
-                        db.set_dirty_since(ino, None);
+                        let done = wait_until_done(api, &resp.id, WAIT_DONE_MAX).await;
+                        if done {
+                            db.set_mirrored_state(ino, None, Some("done"), Some(now_ms()));
+                        } else {
+                            tracing::warn!(filepath = %job.filepath, remote_id = %resp.id, "push: wait_until_done timed out after POST; deferring status to poller");
+                        }
+                        db.clear_dirty_since_if_unchanged(ino, job.dirty_since_at_claim);
                         db.push_queue_finalize_success(&job.filepath, now_ms());
                         db.push_notify().notify_one();
                     }
@@ -367,9 +375,13 @@ async fn process_binary_upload(
             );
             db.set_remote_id(ino, &resp.id);
             db.push_queue_set_remote_id(&job.filepath, &resp.id);
-            wait_until_done(api, &resp.id, WAIT_DONE_MAX).await;
-            db.set_mirrored_state(ino, None, Some("done"), Some(now_ms()));
-            db.set_dirty_since(ino, None);
+            let done = wait_until_done(api, &resp.id, WAIT_DONE_MAX).await;
+            if done {
+                db.set_mirrored_state(ino, None, Some("done"), Some(now_ms()));
+            } else {
+                tracing::warn!(filepath = %job.filepath, remote_id = %resp.id, "push: wait_until_done timed out after multipart upload; deferring status to poller");
+            }
+            db.clear_dirty_since_if_unchanged(ino, job.dirty_since_at_claim);
             db.push_queue_finalize_success(&job.filepath, now_ms());
             db.push_notify().notify_one();
         }

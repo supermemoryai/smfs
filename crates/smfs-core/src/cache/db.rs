@@ -180,6 +180,33 @@ impl Db {
         );
     }
 
+    /// Clear `dirty_since` only if it still matches `expected_ms` (compare-and-swap).
+    /// Returns `true` if the flag was cleared.
+    pub(crate) fn clear_dirty_since_if_unchanged(
+        &self,
+        ino: u64,
+        expected_ms: Option<i64>,
+    ) -> bool {
+        let conn = self.conn.lock();
+        let changed = match expected_ms {
+            Some(ms) => conn
+                .execute(
+                    "UPDATE fs_inode SET dirty_since = NULL \
+                     WHERE ino = ?1 AND dirty_since = ?2",
+                    rusqlite::params![ino as i64, ms],
+                )
+                .unwrap_or(0),
+            None => conn
+                .execute(
+                    "UPDATE fs_inode SET dirty_since = NULL \
+                     WHERE ino = ?1 AND dirty_since IS NULL",
+                    rusqlite::params![ino as i64],
+                )
+                .unwrap_or(0),
+        };
+        changed > 0
+    }
+
     /// Get the dirty watermark for an inode, if any.
     pub(crate) fn get_dirty_since(&self, ino: u64) -> Option<i64> {
         let conn = self.conn.lock();
@@ -380,7 +407,7 @@ impl Db {
     }
 
     /// Atomically claim the next queued job whose backoff has elapsed.
-    /// Returns None if empty or everything is inflight / backing off.
+    /// Snapshots `dirty_since` at claim time for CAS on the success path.
     pub(crate) fn push_queue_claim_next(&self, now_ms: i64) -> Option<PushJob> {
         let conn = self.conn.lock();
         let row: (
@@ -426,6 +453,17 @@ impl Db {
             return None;
         }
 
+        // Snapshot dirty_since for CAS in the success path.
+        let dirty_since_at_claim = content_ino.and_then(|ino| {
+            conn.query_row(
+                "SELECT dirty_since FROM fs_inode WHERE ino = ?1",
+                [ino],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+        });
+
         Some(PushJob {
             filepath,
             op,
@@ -433,6 +471,7 @@ impl Db {
             rename_to,
             remote_id,
             attempt,
+            dirty_since_at_claim,
         })
     }
 
@@ -703,6 +742,8 @@ pub(crate) struct PushJob {
     pub rename_to: Option<String>,
     pub remote_id: Option<String>,
     pub attempt: i64,
+    /// `dirty_since` at claim time, for CAS clearing after `wait_until_done`.
+    pub dirty_since_at_claim: Option<i64>,
 }
 
 #[derive(Debug)]
