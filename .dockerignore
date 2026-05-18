@@ -1,0 +1,14 @@
+.git/
+.devcontainer/
+target/
+
+bash/node_modules/
+bash/.turbo/
+bash/dist/
+bash/coverage/
+
+bash-py/.venv/
+bash-py/__pycache__/
+bash-py/.pytest_cache/
+bash-py/dist/
+bash-py/build/

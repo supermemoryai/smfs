@@ -1,0 +1,14 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    fuse3 \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG SMFS_VERSION=latest
+
+RUN curl -fsSL https://smfs.ai/install | SMFS_INSTALL_DIR=/usr/local/bin bash -s -- "${SMFS_VERSION}"
+
+ENTRYPOINT ["smfs"]
+CMD ["--help"]

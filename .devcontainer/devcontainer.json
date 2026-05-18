@@ -1,0 +1,25 @@
+{
+  "name": "smfs",
+  "build": {
+    "context": "..",
+    "dockerfile": "../Dockerfile"
+  },
+  "runArgs": [
+    "--device",
+    "/dev/fuse",
+    "--cap-add",
+    "SYS_ADMIN"
+  ],
+  "overrideCommand": true,
+  "remoteEnv": {
+    "SUPERMEMORY_API_KEY": "${localEnv:SUPERMEMORY_API_KEY}",
+    "SUPERMEMORY_API_URL": "${localEnv:SUPERMEMORY_API_URL}"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer"
+      ]
+    }
+  }
+}

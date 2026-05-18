@@ -20,6 +20,7 @@ Two access flows depending on the runtime:
 - [Semantic search](#semantic-search)
 - [`bash/` virtual bash tool](#bash-virtual-bash-tool)
 - [Build from source](#build-from-source)
+- [Docker and devcontainers](#docker-and-devcontainers)
 - [License](#license)
 
 ## Install
@@ -151,6 +152,63 @@ cargo build --release
 ```
 
 Requires Rust 1.80 or newer.
+
+## Docker and devcontainers
+
+### Run smfs in Docker
+
+Build the development image from this checkout:
+
+```sh
+docker build -t smfs:dev .
+docker run --rm smfs:dev --help
+```
+
+Mount a Supermemory container inside Docker with FUSE enabled:
+
+```sh
+docker run --rm -it \
+  --device /dev/fuse \
+  --cap-add SYS_ADMIN \
+  -e SUPERMEMORY_API_KEY="$SUPERMEMORY_API_KEY" \
+  smfs:dev mount agent_memory --path /mnt/memory
+```
+
+The release Dockerfile uses the same installer as the shell quickstart:
+
+```sh
+docker build -t smfs:release -f docker/Dockerfile.release .
+```
+
+When an official image is published, the same run flags apply:
+
+```sh
+docker run --rm -it \
+  --device /dev/fuse \
+  --cap-add SYS_ADMIN \
+  -e SUPERMEMORY_API_KEY="$SUPERMEMORY_API_KEY" \
+  ghcr.io/supermemoryai/smfs:latest mount agent_memory --path /mnt/memory
+```
+
+### Use smfs inside a devcontainer
+
+Open this repository in VS Code or Cursor and choose "Reopen in Container".
+The devcontainer builds the root `Dockerfile`, passes through `SUPERMEMORY_API_KEY`
+and `SUPERMEMORY_API_URL`, and starts with `smfs` on `PATH`.
+
+### FUSE requirements
+
+Docker runs Linux containers, so smfs uses the FUSE backend in Docker. The NFS
+backend is for macOS hosts and is not used inside Linux containers.
+
+FUSE needs access to `/dev/fuse` and the `SYS_ADMIN` capability:
+
+```sh
+--device /dev/fuse --cap-add SYS_ADMIN
+```
+
+If your Docker environment does not expose `/dev/fuse`, use a Linux host or a
+container runtime that supports FUSE devices.
 
 ## License
 
