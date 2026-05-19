@@ -601,7 +601,6 @@ class SupermemoryVolume:
                 "containerTag": self.container_tag,
                 "searchMode": "hybrid",
                 "include": {"documents": True},
-                "limit": 50,
             }
             if filepath is not None:
                 body["filepath"] = filepath

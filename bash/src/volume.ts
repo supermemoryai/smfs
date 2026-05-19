@@ -578,7 +578,6 @@ export class SupermemoryVolume {
         containerTag: this.containerTag,
         searchMode: "hybrid",
         include: { documents: true },
-        limit: 50,
       };
       if (params.filepath !== undefined) body.filepath = params.filepath;
       resp = await this.client.search.memories(body);
