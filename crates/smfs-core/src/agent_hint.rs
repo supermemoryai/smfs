@@ -121,7 +121,7 @@ fn render_default_block(tag: &str, mount_path: &Path) -> String {
     format!(
         "{begin}\n\
          <!-- managed by `smfs mount`; auto-removed on `smfs unmount` -->\n\
-         The directory `{path_str}/` is a Supermemory mount with semantic search.\n\
+         The directory `{path_str}/` is searchable by meaning, not just filename.\n\
          For semantic search use: smfs grep \"query\" (or smfs grep \"query\" path/\n\
          to scope to a folder or single file). It returns\n\
          <path>:<line>-<line>:<chunk>. From there, read just the line range\n\
