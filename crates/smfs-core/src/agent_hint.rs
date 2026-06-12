@@ -82,7 +82,17 @@ fn home_dir() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf())
 }
 
-fn render_block(tag: &str, mount_path: &Path) -> String {
+/// Dispatcher. Claude gets `render_claude_block`; Codex and Gemini share
+/// `render_default_block`. The two bodies are nearly identical — only the
+/// opener differs, see `render_default_block`.
+fn render_block(tag: &str, mount_path: &Path, agent: &str) -> String {
+    match agent {
+        "Claude Code" => render_claude_block(tag, mount_path),
+        _ => render_default_block(tag, mount_path),
+    }
+}
+
+fn render_claude_block(tag: &str, mount_path: &Path) -> String {
     let begin = begin_marker(tag);
     let end = end_marker(tag);
     let path_str = mount_path.display();
@@ -90,16 +100,38 @@ fn render_block(tag: &str, mount_path: &Path) -> String {
         "{begin}\n\
          <!-- managed by `smfs mount`; auto-removed on `smfs unmount` -->\n\
          The directory `{path_str}/` is a Supermemory mount with semantic search.\n\
-         When searching inside this directory, use:\n\
-         \n\
-         \u{0020}   smfs grep \"<natural language query>\" {path_str}/\n\
-         \n\
-         instead of grep, rg, find, or your built-in search tool. It returns\n\
-         semantically relevant excerpts via a vector index. For a quick high-\n\
-         level overview before searching, read `{path_str}/profile.md` — it's\n\
-         a reserved virtual file at the mount root with a summary of what\n\
-         this container holds. Files outside this directory behave normally —\n\
-         this rule is scoped to that path only.\n\
+         For semantic search use: smfs grep \"query\" (or smfs grep \"query\" path/\n\
+         to scope to a folder or single file). It returns\n\
+         <path>:<line>-<line>:<chunk>. From there, read just the line range\n\
+         using the Read tool with offset and limit. The chunk text is verbatim\n\
+         from the file, so the Grep tool with any fragment of it pulls every\n\
+         related hit in the corpus.\n\
+         For a quick high-level overview before searching, read\n\
+         `{path_str}/profile.md` — it's a reserved virtual file at the mount\n\
+         root with a summary of what this container holds. Files outside this\n\
+         directory behave normally — this rule is scoped to that path only.\n\
+         {end}\n"
+    )
+}
+
+fn render_default_block(tag: &str, mount_path: &Path) -> String {
+    let begin = begin_marker(tag);
+    let end = end_marker(tag);
+    let path_str = mount_path.display();
+    format!(
+        "{begin}\n\
+         <!-- managed by `smfs mount`; auto-removed on `smfs unmount` -->\n\
+         The directory `{path_str}/` is searchable by meaning, not just filename.\n\
+         For semantic search use: smfs grep \"query\" (or smfs grep \"query\" path/\n\
+         to scope to a folder or single file). It returns\n\
+         <path>:<line>-<line>:<chunk>. From there, read just the line range\n\
+         using the Read tool with offset and limit. The chunk text is verbatim\n\
+         from the file, so the Grep tool with any fragment of it pulls every\n\
+         related hit in the corpus.\n\
+         For a quick high-level overview before searching, read\n\
+         `{path_str}/profile.md` — it's a reserved virtual file at the mount\n\
+         root with a summary of what this container holds. Files outside this\n\
+         directory behave normally — this rule is scoped to that path only.\n\
          {end}\n"
     )
 }
@@ -107,9 +139,9 @@ fn render_block(tag: &str, mount_path: &Path) -> String {
 /// Install the hint into every detected agent file. Idempotent: an existing
 /// block for `tag` is replaced; otherwise the new block is appended.
 pub fn install(tag: &str, mount_path: &Path) -> Result<Vec<PathBuf>> {
-    let block = render_block(tag, mount_path);
     let mut written = Vec::new();
     for target in discover_targets() {
+        let block = render_block(tag, mount_path, target.agent);
         let Some(parent) = target.path.parent() else {
             continue;
         };
