@@ -783,3 +783,94 @@ async fn test_readdir_on_empty_dir_does_not_block_on_api() {
         "readdir burst took {elapsed:?}; empty-dir hot path may be blocking on API"
     );
 }
+
+// Regression: concurrent write during wait_until_done must not lose data.
+#[tokio::test]
+async fn test_dirty_since_cas_prevents_data_loss() {
+    use crate::cache::fs::ReconcileOutcome;
+
+    let fs = fs();
+
+    // epoch-ms values; updated_at "2026-01-01T00:00:05.000Z" ≈ 1767225605000
+    let t1: i64 = 1_767_225_600_000;
+    let t2: i64 = 1_767_225_610_000;
+
+    let (attr, handle) = fs
+        .create_file(ROOT, "idea.md", 0o644, UID, GID)
+        .await
+        .unwrap();
+    handle.write(0, b"version A").await.unwrap();
+    handle.flush().await.unwrap();
+    let ino = attr.ino;
+
+    fs.db()
+        .push_queue_upsert("/idea.md", PushOp::Create, Some(ino), None, None, t1);
+    fs.db().set_dirty_since(ino, Some(t1));
+
+    // Claim snapshots dirty_since.
+    let job = fs.db().push_queue_claim_next(t1 + 1000).unwrap();
+    assert_eq!(job.filepath, "/idea.md");
+    assert_eq!(job.dirty_since_at_claim, Some(t1));
+
+    let remote_id = "remote-doc-123";
+    fs.db().set_remote_id(ino, remote_id);
+    fs.db().push_queue_set_remote_id("/idea.md", remote_id);
+
+    // Concurrent write during wait_until_done window.
+    handle.write(0, b"version B").await.unwrap();
+    handle.flush().await.unwrap();
+    fs.db().set_dirty_since(ino, Some(t2));
+    fs.db()
+        .push_queue_upsert("/idea.md", PushOp::Update, Some(ino), None, Some(remote_id), t2);
+
+    // CAS refuses to clear because dirty_since changed (T2 ≠ T1).
+    fs.db()
+        .set_mirrored_state(ino, Some(t1 + 2000), Some("done"), Some(t1 + 4000));
+    let cleared = fs
+        .db()
+        .clear_dirty_since_if_unchanged(ino, job.dirty_since_at_claim);
+    assert!(!cleared);
+    fs.db().push_queue_finalize_success("/idea.md", t1 + 4000);
+
+    assert_eq!(fs.dirty_since_of(ino), Some(t2));
+
+    // Pull reconciler must skip overwrite (dirty_since T2 > updatedAt T1+5s).
+    let stale_doc = Document {
+        id: remote_id.to_string(),
+        filepath: Some("/idea.md".to_string()),
+        custom_id: None,
+        title: None,
+        summary: None,
+        content: Some("version A".to_string()),
+        status: "done".to_string(),
+        container_tags: None,
+        created_at: "2026-01-01T00:00:00.000Z".to_string(),
+        updated_at: "2026-01-01T00:00:05.000Z".to_string(),
+        metadata: None,
+        type_: Some("text".to_string()),
+        url: None,
+    };
+
+    let outcome = fs.reconcile_one(&stale_doc).unwrap();
+    assert!(matches!(outcome, ReconcileOutcome::SkippedDirty));
+
+    let content = fs.db().read_all_content(ino);
+    assert_eq!(std::str::from_utf8(&content).unwrap(), "version B");
+}
+
+#[tokio::test]
+async fn test_dirty_since_cas_clears_when_unchanged() {
+    let fs = fs();
+    let (attr, handle) = fs
+        .create_file(ROOT, "notes.md", 0o644, UID, GID)
+        .await
+        .unwrap();
+    handle.write(0, b"hello").await.unwrap();
+    handle.flush().await.unwrap();
+    let ino = attr.ino;
+    fs.db().set_dirty_since(ino, Some(1000));
+
+    let cleared = fs.db().clear_dirty_since_if_unchanged(ino, Some(1000));
+    assert!(cleared);
+    assert!(fs.dirty_since_of(ino).is_none());
+}
