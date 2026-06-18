@@ -608,6 +608,50 @@ async def test_grep_c_counts_each_match_once(shell_and_vol):
     assert r.stdout.strip() == "2", r.stdout
 
 
+@pytest.mark.asyncio
+async def test_command_substitution_expands_stdout(shell_and_vol):
+    shell, vol = shell_and_vol
+    await vol.add_doc("/notes/a.txt", "alpha")
+    r = await shell.exec("cat $(find /notes -type f -name '*.txt')")
+    assert r.exit_code == 0, r
+    assert r.stdout == "alpha"
+
+
+@pytest.mark.asyncio
+async def test_command_substitution_splits_unquoted_lines(shell_and_vol):
+    shell, vol = shell_and_vol
+    await vol.add_doc("/notes/a.txt", "alpha\n")
+    await vol.add_doc("/notes/b.txt", "beta\n")
+    r = await shell.exec("cat $(find /notes -type f -name '*.txt')")
+    assert r.exit_code == 0, r
+    assert r.stdout == "alpha\nbeta\n"
+
+
+@pytest.mark.asyncio
+async def test_backtick_command_substitution(shell_and_vol):
+    shell, vol = shell_and_vol
+    await vol.add_doc("/notes/a.txt", "alpha")
+    r = await shell.exec("cat `find /notes -type f -name '*.txt'`")
+    assert r.exit_code == 0, r
+    assert r.stdout == "alpha"
+
+
+@pytest.mark.asyncio
+async def test_arithmetic_expansion(shell_and_vol):
+    shell, vol = shell_and_vol
+    r = await shell.exec("echo $((1 + 2 * 3))")
+    assert r.exit_code == 0, r
+    assert r.stdout == "7\n"
+
+
+@pytest.mark.asyncio
+async def test_arithmetic_expansion_uses_and_updates_variables(shell_and_vol):
+    shell, vol = shell_and_vol
+    r = await shell.exec("n=4 echo $((n += 3)) $((n * 2))")
+    assert r.exit_code == 0, r
+    assert r.stdout == "7 14\n"
+
+
 # --- Nested-synthetic-dir bugs (from v6 PR review) ---
 
 @pytest.mark.asyncio
