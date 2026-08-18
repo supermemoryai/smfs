@@ -58,4 +58,18 @@ describe("createBash factory", () => {
     expect(spy.mock.calls[0]?.[0]).toBe("/");
     spy.mockRestore();
   });
+  it("treats a known slashless sgrep scope as a directory", async () => {
+    const { bash, volume } = await createBash({
+      apiKey: "stub",
+      containerTag: "test_b6_sgrep_directory",
+      eagerLoad: false,
+    });
+    volume.pathIndex.insert("/trajectories/one.md", "doc-1");
+    const search = vi.spyOn(volume, "search").mockResolvedValue({ results: [] });
+
+    const result = await bash.exec("sgrep authentication /trajectories");
+
+    expect(result.exitCode).toBe(0);
+    expect(search).toHaveBeenCalledWith({ q: "authentication", filepath: "/trajectories/" });
+  });
 });

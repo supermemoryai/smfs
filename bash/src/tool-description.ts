@@ -9,7 +9,7 @@ Standard shell commands work as expected: pwd, cd, ls, cat, stat, mkdir, rm, rmd
 Two grep flavors:
 
 - \`grep PATTERN PATH\` — literal substring search on a known file or directory. Use when you know the file and want exact text.
-- \`sgrep QUERY [PATH]\` — semantic search across every file in your container, ranked by meaning. Use when you don't know which file holds what you're looking for, or the wording isn't an exact match. Output is one match per line, formatted \`filepath:content\`. Trailing slash on PATH narrows to a directory; otherwise it's an exact-path match.
+- \`sgrep QUERY [PATH]\` — semantic search across every file in your container, ranked by meaning. Use when you don't know which file holds what you're looking for, or the wording isn't an exact match. Output is one match per line, formatted \`filepath:content\`. Existing file and directory scopes are detected automatically, so both \`/trajectories\` and \`/trajectories/\` find that directory. If a file and directory share a path, choose explicitly with \`--file PATH\` or \`--dir PATH\`. The common grep flag \`-n\` is accepted, but semantic passages do not have exact line numbers.
 
 Workflow: use \`sgrep\` to find which files are relevant, then \`cat\` or \`grep\` on those files to drill in.
 

@@ -46,6 +46,8 @@ console.log(r3.stdout);
 // /notes/security.md:Two-factor authentication via TOTP is required for admin accounts.
 ```
 
+`sgrep` detects whether an existing path is a file or directory, so `sgrep "query" /trajectories` and `sgrep "query" /trajectories/` both search that directory. If a file and directory intentionally share the same path, use `--file /path` or `--dir /path` to disambiguate. The grep-compatible `-n` flag is accepted, but semantic passages do not have exact line numbers.
+
 ## Hand the bash tool to your LLM
 
 `createBash` returns a `toolDescription` field. It's the package's opinionated description of the bash tool (sgrep guidance, persistence semantics, eventual-consistency notes, what's not supported), shipped so the agent doesn't have to discover any of it on its own. Drop it into the `description` field of your tool schema.
