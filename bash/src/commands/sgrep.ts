@@ -6,27 +6,34 @@ interface SgrepArgs {
   query: string;
   filepath?: string;
   help: boolean;
+  lineNumber: boolean;
 }
 
 const HELP =
   "Usage: sgrep QUERY [PATH]\n" +
   "       sgrep [-p PATH] QUERY\n" +
   "  Semantic search across the Supermemory container. Output mirrors\n" +
-  "  grep: 'filepath:line' for every line in every matching passage,\n" +
+  "  grep: 'filepath:passage' for every matching semantic passage,\n" +
   "  ranked by semantic similarity descending.\n" +
   "\n" +
   "  PATH        Restrict to files whose path equals PATH (or starts\n" +
   "              with PATH if it ends with '/'). Positional or via -p.\n" +
+  "  -n, --line-number\n" +
+  "              Accepted for grep compatibility. Semantic passages do\n" +
+  "              not have exact line numbers, so output is unchanged.\n" +
   "  --help      Show this help.\n";
 
 export function parseSgrepArgs(argv: string[]): SgrepArgs | { error: string } {
-  const out: SgrepArgs = { query: "", filepath: undefined, help: false };
+  const out: SgrepArgs = { query: "", filepath: undefined, help: false, lineNumber: false };
   const positional: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === undefined) continue;
     if (a === "--help" || a === "-h") {
       out.help = true;
+    } else if (a === "-n" || a === "--line-number") {
+      // Recorded for future exact-line sources; passage output remains unchanged.
+      out.lineNumber = true;
     } else if (a === "-p") {
       const next = argv[i + 1];
       if (next === undefined) return { error: "sgrep: -p requires an argument" };

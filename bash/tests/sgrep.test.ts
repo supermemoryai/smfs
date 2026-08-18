@@ -5,6 +5,9 @@ describe("sgrep arg parsing", () => {
   it.each([
     [["hello"], { query: "hello", filepath: undefined, help: false }],
     [["hello", "world"], { query: "hello world", filepath: undefined, help: false }],
+    [["-n", "hello"], { query: "hello", filepath: undefined, help: false }],
+    [["--line-number", "hello"], { query: "hello", filepath: undefined, help: false }],
+    [["hello", "-n", "/notes/"], { query: "hello", filepath: "/notes/", help: false }],
     // -p flag, either order
     [["-p", "/notes/", "auth"], { query: "auth", filepath: "/notes/", help: false }],
     [["auth", "-p", "/notes/"], { query: "auth", filepath: "/notes/", help: false }],
