@@ -9,7 +9,7 @@ const emptyListResp = {
   pagination: { currentPage: 1, totalPages: 1, totalItems: 0 },
 };
 
-function makeFs(opts: { listResp?: unknown; getResp?: unknown } = {}) {
+function makeFs(opts: { listResp?: unknown; getResp?: unknown; readOnly?: boolean } = {}) {
   const list = vi.fn().mockResolvedValue(opts.listResp ?? emptyListResp);
   const get = vi.fn().mockResolvedValue(opts.getResp ?? null);
   const deleteBulk = vi.fn().mockResolvedValue({ deletedCount: 1, success: true });
@@ -20,8 +20,8 @@ function makeFs(opts: { listResp?: unknown; getResp?: unknown } = {}) {
     documents: { add, update, get, delete: del, deleteBulk, list },
   } as unknown as Supermemory;
   const volume = new SupermemoryVolume(client, "tag");
-  const fs = new SupermemoryFs(volume);
-  return { fs, volume, list, get, deleteBulk, add };
+  const fs = new SupermemoryFs(volume, { readOnly: opts.readOnly });
+  return { fs, volume, list, get, deleteBulk, add, update, del };
 }
 
 describe("SupermemoryFs.resolvePath (pure normalization)", () => {
@@ -100,6 +100,58 @@ describe("SupermemoryFs.stat mapping", () => {
     expect(s.size).toBe(5);
 
     await expect(fs.stat("/never.md")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
+
+describe("SupermemoryFs read-only mode", () => {
+  it("reports read-only file and directory modes", async () => {
+    const { fs, volume } = makeFs({
+      readOnly: true,
+      listResp: {
+        memories: [
+          {
+            id: "doc-x",
+            filepath: "/a.md",
+            status: "done",
+            updatedAt: "2026-01-15T10:00:00.000Z",
+            content: "hello",
+          },
+        ],
+        pagination: { currentPage: 1, totalPages: 1, totalItems: 1 },
+      },
+    });
+    volume.pathIndex.insert("/a.md", "doc-x");
+    volume.markSyntheticDir("/notes");
+
+    expect((await fs.stat("/a.md")).mode).toBe(0o444);
+    expect((await fs.stat("/notes")).mode).toBe(0o555);
+  });
+
+  it("rejects every mutation before calling the Supermemory API", async () => {
+    const { fs, volume, list, get, deleteBulk, add, update, del } = makeFs({ readOnly: true });
+    volume.pathIndex.insert("/existing.md", "doc-existing");
+    volume.markSyntheticDir("/existing-dir");
+
+    const mutations = [
+      () => fs.writeFile("/new.md", "value"),
+      () => fs.appendFile("/existing.md", "value"),
+      () => fs.mkdir("/new-dir"),
+      () => fs.rm("/existing.md"),
+      () => fs.rmdir("/existing-dir"),
+      () => fs.mv("/existing.md", "/moved.md"),
+      () => fs.cp("/existing.md", "/copied.md"),
+    ];
+
+    for (const mutate of mutations) {
+      await expect(mutate()).rejects.toMatchObject({ code: "EPERM" });
+    }
+    expect(add).not.toHaveBeenCalled();
+    expect(deleteBulk).not.toHaveBeenCalled();
+    expect(list).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(del).not.toHaveBeenCalled();
+    expect(volume.pathIndex.resolve("/existing.md")).toBe("doc-existing");
   });
 });
 

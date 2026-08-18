@@ -10,8 +10,13 @@ export {
   type CreateBashResult,
   createBash,
 } from "./create-bash.js";
-export { SupermemoryFs } from "./supermemory-fs.js";
-export { TOOL_DESCRIPTION } from "./tool-description.js";
+export { READ_ONLY_COMMANDS } from "./read-only-policy.js";
+export { SupermemoryFs, type SupermemoryFsOptions } from "./supermemory-fs.js";
+export {
+  createToolDescription,
+  TOOL_DESCRIPTION,
+  type ToolDescriptionOptions,
+} from "./tool-description.js";
 export type {
   DocResult,
   DocStat,
