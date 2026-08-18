@@ -45,8 +45,24 @@ function normalizePath(input: string): string {
   return `/${stack.join("/")}`;
 }
 
+export interface SupermemoryFsOptions {
+  /** Reject every filesystem mutation while keeping reads and search available. */
+  readOnly?: boolean;
+}
+
 export class SupermemoryFs implements IFileSystem {
-  constructor(public readonly volume: SupermemoryVolume) {}
+  readonly readOnly: boolean;
+
+  constructor(
+    public readonly volume: SupermemoryVolume,
+    options: SupermemoryFsOptions = {},
+  ) {
+    this.readOnly = options.readOnly ?? false;
+  }
+
+  private assertMutable(path: string, operation: string): void {
+    if (this.readOnly) throw eperm(normalizePath(path), operation);
+  }
 
   resolvePath(base: string, path: string): string {
     const absolute = path.startsWith("/") ? path : `${base.replace(/\/$/, "")}/${path}`;
@@ -91,7 +107,7 @@ export class SupermemoryFs implements IFileSystem {
       isFile: docStat.isFile,
       isDirectory: docStat.isDirectory,
       isSymbolicLink: false,
-      mode: docStat.isDirectory ? 0o755 : 0o644,
+      mode: docStat.isDirectory ? (this.readOnly ? 0o555 : 0o755) : this.readOnly ? 0o444 : 0o644,
       size: docStat.size,
       mtime: docStat.mtime,
     };
@@ -188,6 +204,7 @@ export class SupermemoryFs implements IFileSystem {
     _options?: WriteFileOptions | BufferEncoding,
   ): Promise<void> {
     const norm = normalizePath(path);
+    this.assertMutable(norm, "write");
     if (this.volume.isReservedPath(norm)) throw eperm(norm, "write");
     if (this.volume.pathIndex.isDirectory(norm) && !this.volume.pathIndex.isFile(norm)) {
       throw eisdir(norm);
@@ -203,6 +220,7 @@ export class SupermemoryFs implements IFileSystem {
     _options?: WriteFileOptions | BufferEncoding,
   ): Promise<void> {
     const norm = normalizePath(path);
+    this.assertMutable(norm, "append");
     if (this.volume.isReservedPath(norm)) throw eperm(norm, "write");
     if (this.volume.pathIndex.isDirectory(norm) && !this.volume.pathIndex.isFile(norm)) {
       throw eisdir(norm);
@@ -222,6 +240,7 @@ export class SupermemoryFs implements IFileSystem {
 
   async mkdir(path: string, options?: MkdirOptions): Promise<void> {
     const norm = normalizePath(path);
+    this.assertMutable(norm, "mkdir");
     if (this.volume.isReservedPath(norm)) throw eperm(norm, "mkdir");
     if (this.volume.pathIndex.isFile(norm)) throw enotdir(norm);
     if (this.volume.pathIndex.isDirectory(norm) && !options?.recursive) {
@@ -241,6 +260,7 @@ export class SupermemoryFs implements IFileSystem {
 
   async rm(path: string, options?: RmOptions): Promise<void> {
     const norm = normalizePath(path);
+    this.assertMutable(norm, "rm");
     if (this.volume.isReservedPath(norm)) throw eperm(norm, "unlink");
     const isDir = this.volume.pathIndex.isDirectory(norm) && !this.volume.pathIndex.isFile(norm);
     if (isDir) {
@@ -267,6 +287,7 @@ export class SupermemoryFs implements IFileSystem {
 
   async rmdir(path: string, _options?: RmOptions): Promise<void> {
     const norm = normalizePath(path);
+    this.assertMutable(norm, "rmdir");
     if (this.volume.pathIndex.isFile(norm)) throw enotdir(norm);
     if (!this.volume.pathIndex.isDirectory(norm)) throw enoent(norm);
     if (!(await this.volume.isDirEmpty(norm))) throw enotempty(norm);
@@ -276,6 +297,8 @@ export class SupermemoryFs implements IFileSystem {
   async mv(src: string, dest: string): Promise<void> {
     const srcN = normalizePath(src);
     const destN = normalizePath(dest);
+    this.assertMutable(srcN, "rename");
+    this.assertMutable(destN, "rename");
     if (this.volume.isReservedPath(srcN)) throw eperm(srcN, "rename");
     if (this.volume.isReservedPath(destN)) throw eperm(destN, "rename");
     const isDir = this.volume.pathIndex.isDirectory(srcN) && !this.volume.pathIndex.isFile(srcN);
@@ -293,6 +316,7 @@ export class SupermemoryFs implements IFileSystem {
   async cp(src: string, dest: string, options?: CpOptions): Promise<void> {
     const srcN = normalizePath(src);
     const destN = normalizePath(dest);
+    this.assertMutable(destN, "copy");
     if (this.volume.isReservedPath(destN)) throw eperm(destN, "write");
     if (this.volume.isReservedPath(srcN)) {
       const body = await this.volume.fetchProfile();

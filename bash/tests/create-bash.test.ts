@@ -58,6 +58,7 @@ describe("createBash factory", () => {
     expect(spy.mock.calls[0]?.[0]).toBe("/");
     spy.mockRestore();
   });
+
   it("treats a known slashless sgrep scope as a directory", async () => {
     const { bash, volume } = await createBash({
       apiKey: "stub",
@@ -71,5 +72,52 @@ describe("createBash factory", () => {
 
     expect(result.exitCode).toBe(0);
     expect(search).toHaveBeenCalledWith({ q: "authentication", filepath: "/trajectories/" });
+  });
+
+  it("uses the real shell parser for quoted pipes in read-only mode", async () => {
+    const { bash, toolDescription } = await createBash({
+      apiKey: "stub",
+      containerTag: "test_b6_readonly_pipe",
+      eagerLoad: false,
+      readOnly: true,
+    });
+
+    const piped = await bash.exec("printf '%s\\n' 'A|B' 'C' | grep -F 'A|B'");
+    const available = await bash.exec("type rg; type rm");
+
+    expect(piped).toMatchObject({ exitCode: 0, stdout: "A|B\n" });
+    expect(available.stdout).toContain("rg is");
+    expect(available.stderr).toContain("rm: not found");
+    expect(toolDescription).toContain("read-only");
+    expect(toolDescription).toContain("rejected with EPERM");
+  });
+
+  it("blocks redirect writes at the filesystem boundary", async () => {
+    const { bash, volume } = await createBash({
+      apiKey: "stub",
+      containerTag: "test_b6_readonly_redirect",
+      eagerLoad: false,
+      readOnly: true,
+    });
+    const addDoc = vi.spyOn(volume, "addDoc");
+
+    const result = await bash.exec("echo blocked > /blocked.md");
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("EPERM");
+    expect(addDoc).not.toHaveBeenCalled();
+  });
+
+  it("honors an explicit typed command allowlist", async () => {
+    const { bash } = await createBash({
+      apiKey: "stub",
+      containerTag: "test_b6_command_allowlist",
+      eagerLoad: false,
+      readOnly: true,
+      commands: ["printf", "grep"],
+    });
+
+    expect((await bash.exec("printf ok | grep ok")).stdout).toBe("ok\n");
+    expect((await bash.exec("rg --help")).exitCode).toBe(127);
   });
 });

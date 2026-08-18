@@ -1,10 +1,11 @@
-import type { BashExecResult, BashLogger, BashOptions, ExecOptions } from "just-bash";
+import type { BashExecResult, BashLogger, BashOptions, CommandName, ExecOptions } from "just-bash";
 import { Bash } from "just-bash";
 import Supermemory from "supermemory";
 import { createSgrepCommand } from "./commands/sgrep.js";
 import { FsError } from "./errors.js";
+import { READ_ONLY_COMMANDS } from "./read-only-policy.js";
 import { SupermemoryFs } from "./supermemory-fs.js";
-import { TOOL_DESCRIPTION } from "./tool-description.js";
+import { createToolDescription } from "./tool-description.js";
 import { SupermemoryVolume } from "./volume.js";
 
 type ExecutionLimits = NonNullable<BashOptions["executionLimits"]>;
@@ -20,6 +21,13 @@ export interface CreateBashOptions {
   env?: Record<string, string>;
   executionLimits?: ExecutionLimits;
   logger?: BashLogger;
+  /** Restrict the registered just-bash built-ins. sgrep remains available. */
+  commands?: readonly CommandName[];
+  /**
+   * Reject every filesystem mutation. When commands is omitted, a read-oriented
+   * built-in allowlist is also applied. Default false.
+   */
+  readOnly?: boolean;
   /**
    * Content-cache TTL in ms.
    *   undefined → 150_000 (2.5 min, multi-writer default)
@@ -52,7 +60,7 @@ export async function createBash(opts: CreateBashOptions): Promise<CreateBashRes
   const volume = new SupermemoryVolume(client, opts.containerTag, {
     cacheOptions: opts.cacheTtlMs === undefined ? undefined : { ttlMs: opts.cacheTtlMs },
   });
-  const fs = new SupermemoryFs(volume);
+  const fs = new SupermemoryFs(volume, { readOnly: opts.readOnly });
 
   const doWarm = async () => {
     await volume.listByPrefix("/", { withContent: opts.eagerContent ?? true });
@@ -66,6 +74,12 @@ export async function createBash(opts: CreateBashOptions): Promise<CreateBashRes
   // customCommand resolution.
   const env: Record<string, string> = { PATH: "", ...(opts.env ?? {}) };
 
+  const commands = opts.commands
+    ? [...opts.commands]
+    : opts.readOnly
+      ? [...READ_ONLY_COMMANDS]
+      : undefined;
+
   const bash = new Bash({
     fs,
     customCommands: [createSgrepCommand({ includeDocIds: opts.includeDocIds })],
@@ -73,6 +87,7 @@ export async function createBash(opts: CreateBashOptions): Promise<CreateBashRes
     env,
     // just-bash's defense-in-depth patches setTimeout, which the Supermemory SDK uses for retries.
     defenseInDepth: false,
+    ...(commands ? { commands } : {}),
     ...(opts.executionLimits ? { executionLimits: opts.executionLimits } : {}),
     ...(opts.logger ? { logger: opts.logger } : {}),
   });
@@ -97,7 +112,10 @@ export async function createBash(opts: CreateBashOptions): Promise<CreateBashRes
   return {
     bash,
     volume,
-    toolDescription: TOOL_DESCRIPTION,
+    toolDescription: createToolDescription({
+      readOnly: opts.readOnly,
+      ...(commands ? { commands } : {}),
+    }),
     configureMemoryPaths: (paths: string[]) => volume.configureMemoryPaths(paths),
     refresh: doWarm,
   };

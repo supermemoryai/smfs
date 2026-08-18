@@ -8,6 +8,7 @@ A virtual bash environment for AI agents, backed by your [Supermemory](https://s
 - [Quickstart](#quickstart)
 - [Hand the bash tool to your LLM](#hand-the-bash-tool-to-your-llm)
 - [Options](#options)
+- [Read-only agent tools](#read-only-agent-tools)
 - [What's not supported](#whats-not-supported)
 - [License](#license)
 
@@ -123,6 +124,8 @@ createBash({
   eagerLoad?: boolean,          // default: true (warm pathIndex at construction)
   eagerContent?: boolean,       // default: true (also warm content cache)
   cacheTtlMs?: number | null,   // default: 150_000 (2.5 min). null = never expires (single-writer). 0 = no cache.
+  commands?: readonly CommandName[], // optional built-in allowlist; sgrep stays available
+  readOnly?: boolean,           // default: false; blocks all filesystem mutations
   cwd?: string,                 // default: "/home/user"
   env?: Record<string, string>,
   executionLimits?: ExecutionLimits,  // pass-through to just-bash
@@ -133,6 +136,27 @@ createBash({
 For very large containers (10k+ docs), set `eagerContent: false` to skip the content warm and pay HTTP per `cat`. Path resolution stays warm.
 
 `cacheTtlMs` controls how long the in-memory content cache trusts itself. The default (2.5 min) assumes other writers exist (other agent sessions, dashboard uploads, webhooks). Single-writer apps can pass `null` for max speed.
+
+## Read-only agent tools
+
+For benchmark agents, support bots, and other untrusted readers, enable the filesystem policy instead of pre-parsing command strings:
+
+```typescript
+import { createBash } from "@supermemory/bash";
+
+const { bash, toolDescription } = await createBash({
+  apiKey: process.env.SUPERMEMORY_API_KEY!,
+  containerTag: "benchmark_run",
+  readOnly: true,
+});
+
+await bash.exec("sgrep -n 'incident filters' /trajectories");
+await bash.exec("cat /trajectories/one.md | grep -F 'A|B'");
+```
+
+`readOnly: true` applies the exported `READ_ONLY_COMMANDS` policy by default. The resulting environment includes `grep`, `rg`, the custom `sgrep`, and the usual inspection and text-processing tools, while omitting mutation commands such as `rm`, `mv`, and `cp`. The filesystem independently rejects writes—including `>`, `>>`, and write-capable flags—with `EPERM`, so callers do not need a quote-sensitive command validator.
+
+Pass a typed `commands` array to customize the built-ins. `sgrep` remains registered as a custom command. Always pass the original command to `bash.exec`; the underlying AST parser correctly distinguishes a pipeline operator from a quoted literal such as `'A|B'`.
 
 ## What's not supported
 
