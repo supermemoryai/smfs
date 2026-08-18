@@ -11,6 +11,14 @@ describe("sgrep arg parsing", () => {
     // -p flag, either order
     [["-p", "/notes/", "auth"], { query: "auth", filepath: "/notes/", help: false }],
     [["auth", "-p", "/notes/"], { query: "auth", filepath: "/notes/", help: false }],
+    [
+      ["auth", "--file", "/trajectories"],
+      { query: "auth", filepath: "/trajectories", filepathMode: "file" },
+    ],
+    [
+      ["--dir", "/trajectories", "auth"],
+      { query: "auth", filepath: "/trajectories", filepathMode: "directory" },
+    ],
     // grep-style positional path (last positional starting with /)
     [["compiler", "/notes/"], { query: "compiler", filepath: "/notes/", help: false }],
     [
@@ -28,6 +36,7 @@ describe("sgrep arg parsing", () => {
     [[], "missing QUERY"],
     [["-p"], "-p requires"],
     [["--unknown"], "unknown flag"],
+    [["auth", "-p", "/one", "--dir", "/two"], "only one path scope"],
   ])("rejects %j with %j", (argv, fragment) => {
     const got = parseSgrepArgs(argv);
     expect("error" in got && got.error.includes(fragment)).toBe(true);
