@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: "peak-ubuntu-24.04-4"
     defaults:
       run:
         working-directory: bash-py
@@ -51,7 +51,7 @@ jobs:
   publish:
     needs: check
     if: false && needs.check.outputs.should_publish == 'true'
-    runs-on: ubuntu-latest
+    runs-on: "peak-ubuntu-24.04-4"
     defaults:
       run:
         working-directory: bash-py
