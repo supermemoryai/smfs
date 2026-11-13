@@ -242,11 +242,23 @@ impl SupermemoryFs {
         Ok(())
     }
 
-    /// Reconcile a single remote document against the local cache.
-    /// Versioning rules: if local `dirty_since` is newer than the remote's
-    /// `updatedAt`, skip (local write in progress wins). Otherwise create,
-    /// rename, or rewrite chunks as needed.
     pub(crate) fn reconcile_one(&self, doc: &crate::api::Document) -> VfsResult<ReconcileOutcome> {
+        self.reconcile_document(doc, true)
+    }
+
+    pub(crate) fn reconcile_inflight_document(
+        &self,
+        doc: &crate::api::Document,
+    ) -> VfsResult<ReconcileOutcome> {
+        self.reconcile_document(doc, false)
+    }
+
+    // Only pull reconciliation may apply remote path changes.
+    fn reconcile_document(
+        &self,
+        doc: &crate::api::Document,
+        apply_remote_rename: bool,
+    ) -> VfsResult<ReconcileOutcome> {
         let synth;
         let filepath: &str = match doc.filepath.as_deref() {
             Some(fp) if fp.contains('/') && !fp.ends_with('/') => fp,
@@ -295,6 +307,9 @@ impl SupermemoryFs {
             // Handle rename: current resolved path vs remote filepath.
             let current_fp = self.resolve_filepath(existing_ino);
             if current_fp.as_deref() != Some(filepath) {
+                if !apply_remote_rename {
+                    return Ok(ReconcileOutcome::DeferredProcessing);
+                }
                 self.apply_rename_to(existing_ino, dir, filename)?;
             }
 

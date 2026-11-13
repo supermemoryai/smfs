@@ -544,7 +544,7 @@ pub async fn run_inflight_poller(fs: Arc<SupermemoryFs>, mut shutdown: watch::Re
                 // Disappeared from the processing list — terminal state.
                 // Fall back to a single GET to learn which terminal.
                 match api.get_document(&row.remote_id).await {
-                    Ok(doc) if doc.status == "done" => match fs.reconcile_one(&doc) {
+                    Ok(doc) if doc.status == "done" => match fs.reconcile_inflight_document(&doc) {
                         Ok(outcome) => {
                             tracing::debug!(
                                 ino = row.ino,
