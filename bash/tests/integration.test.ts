@@ -49,8 +49,8 @@ async function waitTerminal(
 ): Promise<string | null> {
   const start = Date.now();
   while (Date.now() - start < max) {
-    const got = (await volume.client.documents.get(id)) as { status?: string };
-    if (got.status === "done" || got.status === "failed") return got.status;
+    const got = await volume.client.documents.get(volume.containerTag, id);
+    if (got.system.status === "done" || got.system.status === "failed") return got.system.status;
     await new Promise((r) => setTimeout(r, 1500));
   }
   return null;
@@ -214,6 +214,14 @@ describe.skipIf(!apiKey)("integration: live container end-to-end", () => {
 
     const r2 = await bash.exec("cat /todo-backup.md");
     expect(r2.stdout).toContain("write the report");
+    const sourceId = volume.pathIndex.resolve("/todo.md");
+    const copiedId = volume.pathIndex.resolve("/todo-backup.md");
+    expect(sourceId).toBeTruthy();
+    expect(copiedId).toBeTruthy();
+    expect(copiedId).not.toBe(sourceId);
+    if (!copiedId) throw new Error("Copy did not produce a document ID");
+    const copied = await volume.client.documents.get(containerTag, copiedId);
+    expect((copied.system as { filepath?: string }).filepath).toBe("/todo-backup.md");
   });
 
   it("mkdir -p creates nested synthetic dirs", { timeout: 30_000 }, async () => {

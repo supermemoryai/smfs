@@ -192,7 +192,6 @@ impl ApiClient {
         Ok(all)
     }
 
-    /// List one v5 page, keeping pagination in the query and content options in the body.
     pub async fn list_documents_page(
         &self,
         body: &ListDocumentsReq,
@@ -365,30 +364,70 @@ impl ApiClient {
         Ok(docs)
     }
 
-    /// Create a new document with content and filepath. The request is
-    /// stamped with `metadata.source = "supermemoryfs"` (plus
-    /// `metadata.lastEditedBy` when a user id is available) for attribution.
     pub async fn create_document(
         &self,
         content: &str,
         filepath: &str,
     ) -> Result<CreateDocumentResp, ApiError> {
-        let body = CreateDocumentReq {
+        self.create_document_with_id(content, filepath, None).await
+    }
+
+    pub(crate) async fn create_document_with_id(
+        &self,
+        content: &str,
+        filepath: &str,
+        id: Option<&str>,
+    ) -> Result<CreateDocumentResp, ApiError> {
+        let mut body = serde_json::json!(CreateDocumentReq {
             content: content.to_string(),
             filepath: Some(filepath.to_string()),
             metadata: Some(self.mount_metadata()),
-        };
+        });
+        if let Some(id) = id {
+            body["id"] = serde_json::Value::String(id.to_string());
+        }
 
-        self.post(&self.namespace_path("/document"))
+        let response = self
+            .post(&self.namespace_path("/document"))
             .json(&body)
             .send_with_retry()
-            .await?
-            .parse_json()
-            .await
+            .await;
+        match response {
+            Ok(response) => response.parse_json().await,
+            Err(ApiError::Conflict(conflict)) if id.is_some() => {
+                let id = id.expect("guarded above");
+                let existing = self.get_document(id).await?;
+                if existing.id != id || existing.filepath.as_deref() != Some(filepath) {
+                    return Err(ApiError::Conflict(conflict));
+                }
+                if existing.content.as_deref() == Some(content) {
+                    return Ok(CreateDocumentResp {
+                        id: existing.id,
+                        status: existing.status,
+                    });
+                }
+                if existing.status != "done" && existing.status != "failed" {
+                    return Err(ApiError::Conflict(conflict));
+                }
+                self.update_document(
+                    id,
+                    &UpdateDocumentReq {
+                        content: Some(content.to_string()),
+                        filepath: Some(filepath.to_string()),
+                        metadata: None,
+                    },
+                )
+                .await?;
+                Ok(CreateDocumentResp {
+                    id: id.to_string(),
+                    status: "queued".to_string(),
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
-    /// POST a binary to `/ns/{namespace}/document/file` via multipart. No in-request
-    /// retry — push-queue backoff handles transient failures.
+    /// Binary uploads rely on persistent push-queue retries after transient failures.
     pub async fn create_document_multipart(
         &self,
         bytes: &[u8],

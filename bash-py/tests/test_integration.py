@@ -53,8 +53,10 @@ async def wait_terminal(volume: SupermemoryVolume, doc_id: str, max_s: float = 3
     start = time.monotonic()
     while time.monotonic() - start < max_s:
         try:
-            got = await volume.client._request("GET", f"/v3/documents/{doc_id}")
-            status = got.get("status")
+            got = await volume.client._request(
+                "GET", volume.client._path(volume.container_tag, f"/document/{doc_id}")
+            )
+            status = got["system"]["status"]
             if status in ("done", "failed"):
                 return status
         except Exception:
@@ -203,11 +205,18 @@ async def test_mv_keeps_doc_id_stable(session):
 
 
 async def test_cp_copies_file(session):
-    bash, _ = session
+    bash, vol = session
     r1 = await bash.exec("cp /todo.md /todo-backup.md")
     assert r1.exit_code == 0
     r2 = await bash.exec("cat /todo-backup.md")
     assert "write the report" in r2.stdout
+    source_id = vol.path_index.resolve("/todo.md")
+    copied_id = vol.path_index.resolve("/todo-backup.md")
+    assert source_id and copied_id and source_id != copied_id
+    copied = await vol.client._request(
+        "GET", vol.client._path(vol.container_tag, f"/document/{copied_id}")
+    )
+    assert copied["system"]["filepath"] == "/todo-backup.md"
 
 
 async def test_mkdir_p_creates_nested_dirs(session):

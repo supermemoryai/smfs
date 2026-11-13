@@ -208,6 +208,7 @@ export class SupermemoryVolume {
           this.containerTag,
           {
             content,
+            id: crypto.randomUUID(),
           },
           { additionalBodyParameters: { filepath: path } },
         );
@@ -324,7 +325,10 @@ export class SupermemoryVolume {
         matches.push({ id: m.id, filepath: m.filepath });
       }
     }
-    if (matches.length === 0) return { deleted: 0, errors: [] };
+    if (matches.length === 0) {
+      this.evictSyntheticUnder(prefix);
+      return { deleted: 0, errors: [] };
+    }
     let deleted = 0;
     const errors: Error[] = [];
     for (let i = 0; i < matches.length; i += 100) {

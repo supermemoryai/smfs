@@ -40,7 +40,8 @@ unresolved check leaves synchronization unavailable rather than guessing a
 deletion; the existing offline-mount behavior is retained.
 On a fresh mount, documents without a filesystem path use their public v5 ID
 for the synthesized filename. The cache alias path is intended to preserve
-existing cached names; real mounted upgrade verification remains outstanding.
+existing cached names. A live Linux upgrade from the previous v4 binary retained
+the original cache and internal document ID and replayed a queued offline edit.
 
 The filesystem-specific `filepath` and `memoryFilesystemPaths` fields remain
 supported by the API but are hidden from its public SDK types. SMFS retains
@@ -62,6 +63,10 @@ first collect matching IDs, then delete batches of at most 100, checking per-ID
 errors. Successful deletions are not rolled back when another item fails.
 Directory deletion is a snapshot, not an atomic transaction with concurrent
 remote renames; avoid other writers while deleting a tree.
+
+New text files receive explicit v5 IDs so identical-content copies remain
+separate documents. The native daemon keeps creation IDs stable across retries
+and restarts using its existing cache, without rewriting old remote IDs.
 
 Building this checkout does not update published binaries or packages. Release
 publication is a separate step.

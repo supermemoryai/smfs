@@ -5,19 +5,20 @@ import { SupermemoryFs } from "../src/supermemory-fs.js";
 import { SupermemoryVolume } from "../src/volume.js";
 
 const emptyListResp = {
-  memories: [],
+  documents: [],
   pagination: { currentPage: 1, totalPages: 1, totalItems: 0 },
 };
 
 function makeFs(opts: { listResp?: unknown; getResp?: unknown } = {}) {
   const list = vi.fn().mockResolvedValue(opts.listResp ?? emptyListResp);
   const get = vi.fn().mockResolvedValue(opts.getResp ?? null);
-  const deleteBulk = vi.fn().mockResolvedValue({ deletedCount: 1, success: true });
+  const deleteBulk = vi.fn().mockResolvedValue({ count: 1, errors: [] });
   const add = vi.fn().mockResolvedValue({ id: "new-id", status: "done" });
   const update = vi.fn().mockResolvedValue({ id: "new-id", status: "done" });
-  const del = vi.fn().mockResolvedValue(undefined);
   const client = {
-    documents: { add, update, get, delete: del, deleteBulk, list },
+    add,
+    list,
+    documents: { update, get, delete: deleteBulk },
   } as unknown as Supermemory;
   const volume = new SupermemoryVolume(client, "tag");
   const fs = new SupermemoryFs(volume);
@@ -43,13 +44,13 @@ describe("SupermemoryFs.resolvePath (pure normalization)", () => {
 describe("SupermemoryFs.readdir grouping", () => {
   it("groups paths under a prefix into unique entries; sorts; classifies file vs dir", async () => {
     const memories = [
-      { id: "1", filepath: "/notes/a.md", status: "done", updatedAt: "2026-01-01" },
-      { id: "2", filepath: "/notes/sub/b.md", status: "done", updatedAt: "2026-01-01" },
-      { id: "3", filepath: "/notes/sub/c.md", status: "done", updatedAt: "2026-01-01" },
+      { id: "1", system: { filepath: "/notes/a.md", status: "done", updatedAt: "2026-01-01" } },
+      { id: "2", system: { filepath: "/notes/sub/b.md", status: "done", updatedAt: "2026-01-01" } },
+      { id: "3", system: { filepath: "/notes/sub/c.md", status: "done", updatedAt: "2026-01-01" } },
     ];
     const { fs } = makeFs({
       listResp: {
-        memories,
+        documents: memories,
         pagination: { currentPage: 1, totalPages: 1, totalItems: 3 },
       },
     });
@@ -73,22 +74,19 @@ describe("SupermemoryFs.stat mapping", () => {
     const memories = [
       {
         id: "doc-x",
-        filepath: "/a.md",
-        status: "done",
-        updatedAt: "2026-01-15T10:00:00.000Z",
         content: "hello",
+        system: { filepath: "/a.md", status: "done", updatedAt: "2026-01-15T10:00:00.000Z" },
       },
     ];
     const { fs, volume } = makeFs({
       listResp: {
-        memories,
+        documents: memories,
         pagination: { currentPage: 1, totalPages: 1, totalItems: 1 },
       },
       getResp: {
         id: "doc-x",
         content: "hello",
-        status: "done",
-        updatedAt: "2026-01-15T10:00:00.000Z",
+        system: { status: "done", updatedAt: "2026-01-15T10:00:00.000Z" },
       },
     });
     volume.pathIndex.insert("/a.md", "doc-x");
@@ -113,7 +111,9 @@ describe("SupermemoryFs write-path branch decisions", () => {
   it("rm on directory without recursive throws EISDIR; with recursive uses bulk delete", async () => {
     const { fs, volume } = makeFs({
       listResp: {
-        memories: [{ id: "1", filepath: "/sub/a.md", status: "done", updatedAt: "2026-01-01" }],
+        documents: [
+          { id: "1", system: { filepath: "/sub/a.md", status: "done", updatedAt: "2026-01-01" } },
+        ],
         pagination: { currentPage: 1, totalPages: 1, totalItems: 1 },
       },
     });
@@ -127,7 +127,9 @@ describe("SupermemoryFs write-path branch decisions", () => {
   it("rmdir on non-empty throws ENOTEMPTY", async () => {
     const { fs, volume } = makeFs({
       listResp: {
-        memories: [{ id: "1", filepath: "/sub/a.md", status: "done", updatedAt: "2026-01-01" }],
+        documents: [
+          { id: "1", system: { filepath: "/sub/a.md", status: "done", updatedAt: "2026-01-01" } },
+        ],
         pagination: { currentPage: 1, totalPages: 1, totalItems: 1 },
       },
     });
@@ -148,23 +150,36 @@ describe("SupermemoryFs write-path branch decisions", () => {
     const list = vi.fn().mockResolvedValue(emptyListResp);
     const get = vi.fn().mockResolvedValue(null);
     const client = {
-      documents: { add, update: vi.fn(), get, delete: vi.fn(), deleteBulk: vi.fn(), list },
+      add,
+      list,
+      documents: { update: vi.fn(), get, delete: vi.fn() },
     } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag");
     const fs = new SupermemoryFs(volume);
     await fs.appendFile("/new.md", "tail");
     expect(add).toHaveBeenCalledTimes(1);
-    expect(add.mock.calls[0]?.[0]).toMatchObject({ content: "tail", filepath: "/new.md" });
+    expect(add).toHaveBeenCalledWith(
+      "tag",
+      { content: "tail", id: expect.any(String) },
+      { additionalBodyParameters: { filepath: "/new.md" } },
+    );
   });
 });
 
 describe("SupermemoryFs reserved file /profile.md", () => {
   function makeFsWithProfile(profileBody: { static: string[]; dynamic: string[] }) {
     const list = vi.fn().mockResolvedValue(emptyListResp);
-    const profile = vi.fn().mockResolvedValue({ profile: profileBody });
+    const profile = vi.fn().mockResolvedValue({
+      profile: {
+        static: profileBody.static,
+        dynamic: profileBody.dynamic,
+      },
+    });
     const add = vi.fn().mockResolvedValue({ id: "snap-1", status: "done" });
     const client = {
-      documents: { add, update: vi.fn(), get: vi.fn(), delete: vi.fn(), deleteBulk: vi.fn(), list },
+      add,
+      list,
+      documents: { update: vi.fn(), get: vi.fn(), delete: vi.fn() },
       profile,
     } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag");
@@ -173,7 +188,10 @@ describe("SupermemoryFs reserved file /profile.md", () => {
   }
 
   it("readFile('/profile.md') returns the rendered profile body", async () => {
-    const { fs, profile } = makeFsWithProfile({ static: ["s1"], dynamic: ["d1"] });
+    const { fs, profile } = makeFsWithProfile({
+      static: [{ id: "profile-0", memory: "s1" }],
+      dynamic: [{ id: "profile-0", memory: "d1" }],
+    });
     const body = await fs.readFile("/profile.md");
     expect(body).toContain("# Memory Profile");
     expect(body).toContain("- s1");
@@ -182,7 +200,7 @@ describe("SupermemoryFs reserved file /profile.md", () => {
   });
 
   it("readFileBuffer('/profile.md') returns same body as bytes", async () => {
-    const { fs } = makeFsWithProfile({ static: ["s1"], dynamic: [] });
+    const { fs } = makeFsWithProfile({ static: [{ id: "profile-0", memory: "s1" }], dynamic: [] });
     const buf = await fs.readFileBuffer("/profile.md");
     const decoded = new TextDecoder().decode(buf);
     expect(decoded).toContain("- s1");
@@ -197,7 +215,7 @@ describe("SupermemoryFs reserved file /profile.md", () => {
   });
 
   it("stat('/profile.md') size reflects cached body after first read", async () => {
-    const { fs } = makeFsWithProfile({ static: ["a"], dynamic: [] });
+    const { fs } = makeFsWithProfile({ static: [{ id: "profile-0", memory: "a" }], dynamic: [] });
     expect((await fs.stat("/profile.md")).size).toBe(0);
     const body = await fs.readFile("/profile.md");
     expect((await fs.stat("/profile.md")).size).toBe(new TextEncoder().encode(body).length);
@@ -254,11 +272,14 @@ describe("SupermemoryFs reserved file /profile.md", () => {
   });
 
   it("cp /profile.md /snap.md writes the rendered body to a normal doc", async () => {
-    const { fs, add } = makeFsWithProfile({ static: ["s1"], dynamic: [] });
+    const { fs, add } = makeFsWithProfile({
+      static: [{ id: "profile-0", memory: "s1" }],
+      dynamic: [],
+    });
     await fs.cp("/profile.md", "/snap.md");
     expect(add).toHaveBeenCalledTimes(1);
-    const args = add.mock.calls[0]?.[0] as { content: string; filepath: string };
-    expect(args.filepath).toBe("/snap.md");
+    const args = add.mock.calls[0]?.[1] as { content: string };
+    expect(add.mock.calls[0]?.[2]).toEqual({ additionalBodyParameters: { filepath: "/snap.md" } });
     expect(args.content).toContain("- s1");
     expect(args.content).toContain("# Memory Profile");
   });
@@ -267,10 +288,11 @@ describe("SupermemoryFs reserved file /profile.md", () => {
     const { fs, add } = makeFsWithProfile({ static: [], dynamic: [] });
     await fs.writeFile("/memory/profile.md", "user-owned profile");
     expect(add).toHaveBeenCalledTimes(1);
-    expect(add.mock.calls[0]?.[0]).toMatchObject({
-      content: "user-owned profile",
-      filepath: "/memory/profile.md",
-    });
+    expect(add).toHaveBeenCalledWith(
+      "tag",
+      { content: "user-owned profile", id: expect.any(String) },
+      { additionalBodyParameters: { filepath: "/memory/profile.md" } },
+    );
   });
 });
 
@@ -295,10 +317,13 @@ describe("SupermemoryFs nested-synthetic-dir handling (v6 PR review)", () => {
 
   it("mv of a tree migrates synthetic subdirs to dest", async () => {
     const memories = [
-      { id: "f1", filepath: "/src/file.md", status: "done", updatedAt: "2026-01-01" },
+      { id: "f1", system: { filepath: "/src/file.md", status: "done", updatedAt: "2026-01-01" } },
     ];
     const { fs, volume } = makeFs({
-      listResp: { memories, pagination: { currentPage: 1, totalPages: 1, totalItems: 1 } },
+      listResp: {
+        documents: memories,
+        pagination: { currentPage: 1, totalPages: 1, totalItems: 1 },
+      },
     });
     volume.pathIndex.insert("/src/file.md", "f1");
     await fs.mkdir("/src/empty", { recursive: true });
@@ -311,14 +336,15 @@ describe("SupermemoryFs nested-synthetic-dir handling (v6 PR review)", () => {
     const memories = [
       {
         id: "f1",
-        filepath: "/src/file.md",
-        status: "done",
-        updatedAt: "2026-01-01",
         content: "hi",
+        system: { filepath: "/src/file.md", status: "done", updatedAt: "2026-01-01" },
       },
     ];
     const { fs, volume } = makeFs({
-      listResp: { memories, pagination: { currentPage: 1, totalPages: 1, totalItems: 1 } },
+      listResp: {
+        documents: memories,
+        pagination: { currentPage: 1, totalPages: 1, totalItems: 1 },
+      },
     });
     volume.pathIndex.insert("/src/file.md", "f1");
     await fs.mkdir("/src/empty", { recursive: true });

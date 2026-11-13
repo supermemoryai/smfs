@@ -63,14 +63,10 @@ describe("SupermemoryVolume constructor", () => {
 
   it("does not call any SDK method during construction", () => {
     const trackedClient = {
-      documents: {
-        add: vi.fn(),
-        get: vi.fn(),
-        list: vi.fn(),
-        update: vi.fn(),
-        delete: vi.fn(),
-      },
-      search: { execute: vi.fn() },
+      add: vi.fn(),
+      list: vi.fn(),
+      documents: { get: vi.fn(), update: vi.fn(), delete: vi.fn() },
+      search: vi.fn(),
       profile: vi.fn(),
       patch: vi.fn(),
     } as unknown as Supermemory;
@@ -78,10 +74,10 @@ describe("SupermemoryVolume constructor", () => {
     new SupermemoryVolume(trackedClient, "tag");
 
     const called = [
-      (trackedClient.documents.add as ReturnType<typeof vi.fn>).mock.calls.length,
+      (trackedClient.add as ReturnType<typeof vi.fn>).mock.calls.length,
       (trackedClient.documents.get as ReturnType<typeof vi.fn>).mock.calls.length,
-      (trackedClient.documents.list as ReturnType<typeof vi.fn>).mock.calls.length,
-      (trackedClient.search.execute as ReturnType<typeof vi.fn>).mock.calls.length,
+      (trackedClient.list as ReturnType<typeof vi.fn>).mock.calls.length,
+      (trackedClient.search as ReturnType<typeof vi.fn>).mock.calls.length,
       (trackedClient.profile as ReturnType<typeof vi.fn>).mock.calls.length,
     ];
     expect(called.every((n) => n === 0)).toBe(true);
@@ -91,7 +87,7 @@ describe("SupermemoryVolume constructor", () => {
 // Empty list response is the default for lookupDocId fallback in tests where the
 // path isn't pre-inserted into PathIndex. Tests that need a hit can override.
 const emptyListResp = {
-  memories: [],
+  documents: [],
   pagination: { currentPage: 1, totalPages: 1, totalItems: 0 },
 };
 
@@ -103,7 +99,9 @@ function makeVolumeWithMocks(
   const update = vi.fn().mockResolvedValue(updateResp);
   const list = vi.fn().mockResolvedValue(emptyListResp);
   const client = {
-    documents: { add, update, list },
+    add,
+    list,
+    documents: { update },
   } as unknown as Supermemory;
   const volume = new SupermemoryVolume(client, "test-tag");
   return { volume, add, update, list };
@@ -114,11 +112,13 @@ describe("SupermemoryVolume.addDoc / updateDoc", () => {
     const { volume, add } = makeVolumeWithMocks();
     await volume.addDoc("/notes/a.md", "hello");
     expect(add).toHaveBeenCalledTimes(1);
-    expect(add.mock.calls[0]?.[0]).toMatchObject({
-      content: "hello",
-      containerTag: "test-tag",
-      filepath: "/notes/a.md",
-    });
+    expect(add).toHaveBeenCalledWith(
+      "test-tag",
+      { content: "hello", id: expect.any(String) },
+      {
+        additionalBodyParameters: { filepath: "/notes/a.md" },
+      },
+    );
   });
 
   it("addDoc with new path inserts into pathIndex", async () => {
@@ -147,12 +147,14 @@ describe("SupermemoryVolume.addDoc / updateDoc", () => {
     await volume.addDoc("/notes/a.md", "updated content");
     expect(add).not.toHaveBeenCalled();
     expect(update).toHaveBeenCalledTimes(1);
-    expect(update.mock.calls[0]?.[0]).toBe("doc-existing");
-    expect(update.mock.calls[0]?.[1]).toMatchObject({
-      content: "updated content",
-      containerTag: "test-tag",
-      filepath: "/notes/a.md",
-    });
+    expect(update).toHaveBeenCalledWith(
+      "test-tag",
+      "doc-existing",
+      { content: "updated content" },
+      {
+        additionalBodyParameters: { filepath: "/notes/a.md" },
+      },
+    );
   });
 
   it("addDoc returns 'done' when server returns 'done'", async () => {
@@ -189,7 +191,7 @@ describe("SupermemoryVolume.addDoc / updateDoc", () => {
 
   it("addDoc throws eio when SDK call fails", async () => {
     const add = vi.fn().mockRejectedValue(new Error("network down"));
-    const client = { documents: { add, update: vi.fn() } } as unknown as Supermemory;
+    const client = { add, documents: { update: vi.fn() } } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag");
     await expect(volume.addDoc("/a.md", "x")).rejects.toThrow(/EIO/);
   });
@@ -206,26 +208,47 @@ describe("SupermemoryVolume.addDoc / updateDoc", () => {
     );
     volume.pathIndex.insert("/known.md", "doc-known");
     const result = await volume.updateDoc("/known.md", "new content");
-    expect(update).toHaveBeenCalledWith("doc-known", expect.any(Object));
+    expect(update).toHaveBeenCalledWith(
+      "test-tag",
+      "doc-known",
+      expect.any(Object),
+      expect.any(Object),
+    );
     expect(result).toEqual({ id: "doc-known", status: "done" });
   });
 });
 
 function makeVolumeWithGetMock(
-  doc: Record<string, unknown> | null = { id: "doc-1", content: "hello", status: "done" },
+  doc: Record<string, unknown> | null = {
+    id: "doc-1",
+    content: "hello",
+    system: { status: "done" },
+  },
 ) {
   // After the cache refactor, getDoc on cache miss uses documents.list with a
   // filepath filter rather than documents.get(id). The mock list returns a single
   // memory matching the doc fixture (or empty when null).
-  const list = vi
-    .fn()
-    .mockResolvedValue(
-      doc
-        ? { memories: [doc], pagination: { currentPage: 1, totalPages: 1, totalItems: 1 } }
-        : emptyListResp,
-    );
+  const list = vi.fn().mockResolvedValue(
+    doc
+      ? {
+          documents: [
+            {
+              ...doc,
+              system: doc.system ?? {
+                status: doc.status,
+                filepath: doc.filepath,
+                updatedAt: doc.updatedAt,
+              },
+            },
+          ],
+          pagination: { currentPage: 1, totalPages: 1, totalItems: 1 },
+        }
+      : emptyListResp,
+  );
   const client = {
-    documents: { add: vi.fn(), update: vi.fn(), get: vi.fn(), list },
+    add: vi.fn(),
+    list,
+    documents: { update: vi.fn(), get: vi.fn() },
   } as unknown as Supermemory;
   const volume = new SupermemoryVolume(client, "test-tag");
   return { volume, list };
@@ -252,20 +275,29 @@ describe("SupermemoryVolume.getDoc", () => {
     const { volume, list } = makeVolumeWithGetMock({
       id: "doc-x",
       content: "fetched",
-      status: "done",
+      system: { status: "done" },
     });
     const result = await volume.getDoc("/a.md");
     expect(list).toHaveBeenCalledTimes(1);
-    expect(list.mock.calls[0]?.[0]).toMatchObject({
-      filepath: "/a.md",
-      includeContent: true,
-      limit: 1,
-    });
+    expect(list).toHaveBeenCalledWith(
+      "test-tag",
+      "documents",
+      {
+        limit: 1,
+        page: 1,
+        include: { content: true },
+      },
+      { additionalBodyParameters: { filepath: "/a.md" } },
+    );
     expect(result).toEqual({ id: "doc-x", content: "fetched", status: "done" });
   });
 
   it("status 'done' passes through", async () => {
-    const { volume } = makeVolumeWithGetMock({ id: "d", content: "ok", status: "done" });
+    const { volume } = makeVolumeWithGetMock({
+      id: "d",
+      content: "ok",
+      system: { status: "done" },
+    });
     const result = await volume.getDoc("/a.md");
     expect(result?.status).toBe("done");
   });
@@ -279,7 +311,11 @@ describe("SupermemoryVolume.getDoc", () => {
     ["unknown"],
     ["something-new-from-server"],
   ])("normalizes server status %s → 'processing'", async (serverStatus) => {
-    const { volume } = makeVolumeWithGetMock({ id: "d", content: "x", status: serverStatus });
+    const { volume } = makeVolumeWithGetMock({
+      id: "d",
+      content: "x",
+      system: { status: serverStatus },
+    });
     const result = await volume.getDoc("/a.md");
     expect(result?.status).toBe("processing");
   });
@@ -288,8 +324,8 @@ describe("SupermemoryVolume.getDoc", () => {
     const { volume } = makeVolumeWithGetMock({
       id: "d",
       content: "partial",
-      status: "failed",
       errorMessage: "extraction timeout",
+      system: { status: "failed" },
     });
     const result = await volume.getDoc("/a.md");
     expect(result?.status).toBe("failed");
@@ -300,14 +336,22 @@ describe("SupermemoryVolume.getDoc", () => {
   });
 
   it("status 'failed' with no error fields uses '(unknown)' as reason", async () => {
-    const { volume } = makeVolumeWithGetMock({ id: "d", content: "", status: "failed" });
+    const { volume } = makeVolumeWithGetMock({
+      id: "d",
+      content: "",
+      system: { status: "failed" },
+    });
     const result = await volume.getDoc("/a.md");
     expect(result?.errorReason).toBe("(unknown)");
     expect(result?.content).toMatch(/Reason: \(unknown\)$/);
   });
 
   it("populates cache after successful fetch with normalized status", async () => {
-    const { volume } = makeVolumeWithGetMock({ id: "d", content: "fresh", status: "queued" });
+    const { volume } = makeVolumeWithGetMock({
+      id: "d",
+      content: "fresh",
+      system: { status: "queued" },
+    });
     await volume.getDoc("/a.md");
     const cached = volume.cache.get("/a.md");
     expect(cached?.content).toBe("fresh");
@@ -318,8 +362,8 @@ describe("SupermemoryVolume.getDoc", () => {
     const { volume, list } = makeVolumeWithGetMock({
       id: "d",
       content: "raw",
-      status: "failed",
       errorMessage: "bad mime",
+      system: { status: "failed" },
     });
     await volume.getDoc("/a.md");
     const second = await volume.getDoc("/a.md");
@@ -339,9 +383,11 @@ describe("SupermemoryVolume.getDoc", () => {
   it("throws eio when SDK list throws", async () => {
     const list = vi
       .fn()
-      .mockRejectedValue(Object.assign(new Error("network down"), { status: 500 }));
+      .mockRejectedValue(Object.assign(new Error("network down"), { statusCode: 500 }));
     const client = {
-      documents: { add: vi.fn(), update: vi.fn(), get: vi.fn(), list },
+      add: vi.fn(),
+      list,
+      documents: { update: vi.fn(), get: vi.fn() },
     } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag");
     await expect(volume.getDoc("/a.md")).rejects.toMatchObject({ code: "EIO" });
@@ -349,7 +395,11 @@ describe("SupermemoryVolume.getDoc", () => {
   });
 
   it("treats null SDK content as empty string", async () => {
-    const { volume } = makeVolumeWithGetMock({ id: "d", content: null, status: "done" });
+    const { volume } = makeVolumeWithGetMock({
+      id: "d",
+      content: null,
+      system: { status: "done" },
+    });
     const result = await volume.getDoc("/a.md");
     expect(result?.content).toBe("");
   });
@@ -360,19 +410,14 @@ function makeVolumeWithDeleteMock(opts: { rejectStatus?: number } = {}) {
     ? vi
         .fn()
         .mockRejectedValue(
-          Object.assign(new Error(`http ${opts.rejectStatus}`), { status: opts.rejectStatus }),
+          Object.assign(new Error(`http ${opts.rejectStatus}`), { statusCode: opts.rejectStatus }),
         )
-    : vi.fn().mockResolvedValue(undefined);
+    : vi.fn().mockResolvedValue({ count: 1, errors: [] });
   const list = vi.fn().mockResolvedValue(emptyListResp);
   const client = {
-    documents: {
-      add: vi.fn(),
-      update: vi.fn(),
-      get: vi.fn(),
-      delete: del,
-      deleteBulk: vi.fn(),
-      list,
-    },
+    add: vi.fn(),
+    list,
+    documents: { update: vi.fn(), get: vi.fn(), delete: del },
   } as unknown as Supermemory;
   const volume = new SupermemoryVolume(client, "tag");
   return { volume, del };
@@ -390,7 +435,7 @@ describe("SupermemoryVolume.removeDoc", () => {
     volume.pathIndex.insert("/a.md", "doc-a");
     volume.cache.set("/a.md", "cached", "done");
     await volume.removeDoc("/a.md");
-    expect(del).toHaveBeenCalledWith("doc-a");
+    expect(del).toHaveBeenCalledWith("tag", { ids: ["doc-a"] });
     expect(volume.pathIndex.resolve("/a.md")).toBeNull();
     expect(volume.cache.get("/a.md")).toBeNull();
   });
@@ -420,27 +465,31 @@ describe("SupermemoryVolume.removeDoc", () => {
 
 function makeVolumeForBulk(
   listResponses: Array<{
-    memories: Array<{ id: string; filepath?: string }>;
+    documents: Array<{ id: string; filepath?: string }>;
     pagination: { currentPage: number; totalPages: number; totalItems: number };
   }>,
   bulkResponse: {
-    deletedCount: number;
+    count: number;
     success: boolean;
     errors?: Array<{ id: string; error: string }>;
-  } = { deletedCount: 0, success: true },
+  } = { count: 0, success: true },
 ) {
   const list = vi.fn();
-  for (const r of listResponses) list.mockResolvedValueOnce(r);
-  const deleteBulk = vi.fn().mockResolvedValue(bulkResponse);
+  for (const r of listResponses)
+    list.mockResolvedValueOnce({
+      ...r,
+      documents: r.documents.map((d) => ({
+        ...d,
+        system: { filepath: d.filepath, status: "done", updatedAt: "2026-01-01" },
+      })),
+    });
+  const deleteBulk = vi
+    .fn()
+    .mockResolvedValue({ ...bulkResponse, errors: bulkResponse.errors ?? [] });
   const client = {
-    documents: {
-      add: vi.fn(),
-      update: vi.fn(),
-      get: vi.fn(),
-      delete: vi.fn(),
-      list,
-      deleteBulk,
-    },
+    add: vi.fn(),
+    list,
+    documents: { update: vi.fn(), get: vi.fn(), delete: deleteBulk },
   } as unknown as Supermemory;
   const volume = new SupermemoryVolume(client, "tag");
   return { volume, list, deleteBulk };
@@ -448,16 +497,24 @@ function makeVolumeForBulk(
 
 describe("SupermemoryVolume.removeByPrefix", () => {
   it("calls deleteBulk once with {containerTags, filepath} and evicts matching paths", async () => {
-    const { volume, deleteBulk } = makeVolumeForBulk([], { deletedCount: 2, success: true });
+    const { volume, deleteBulk } = makeVolumeForBulk(
+      [
+        {
+          documents: [
+            { id: "id1", filepath: "/notes/a.md" },
+            { id: "id2", filepath: "/notes/b.md" },
+          ],
+          pagination: { currentPage: 1, totalPages: 1, totalItems: 2 },
+        },
+      ],
+      { count: 2, success: true },
+    );
     volume.pathIndex.insert("/notes/a.md", "id1");
     volume.pathIndex.insert("/notes/b.md", "id2");
     volume.pathIndex.insert("/other.md", "id3");
     const result = await volume.removeByPrefix("/notes/");
     expect(deleteBulk).toHaveBeenCalledTimes(1);
-    expect(deleteBulk.mock.calls[0]?.[0]).toMatchObject({
-      containerTags: ["tag"],
-      filepath: "/notes/",
-    });
+    expect(deleteBulk).toHaveBeenCalledWith("tag", { ids: ["id1", "id2"] });
     expect(result.deleted).toBe(2);
     expect(volume.pathIndex.resolve("/notes/a.md")).toBeNull();
     expect(volume.pathIndex.resolve("/notes/b.md")).toBeNull();
@@ -468,15 +525,15 @@ describe("SupermemoryVolume.removeByPrefix", () => {
     const { volume, list, deleteBulk } = makeVolumeForBulk(
       [
         {
-          memories: [{ id: "id1", filepath: "/a.md" }],
+          documents: [{ id: "id1", filepath: "/a.md" }],
           pagination: { currentPage: 1, totalPages: 1, totalItems: 1 },
         },
       ],
-      { deletedCount: 1, success: true },
+      { count: 1, success: true },
     );
     await volume.removeByPrefix("");
     expect(list).toHaveBeenCalled();
-    expect(deleteBulk.mock.calls[0]?.[0]).toEqual({ ids: ["id1"] });
+    expect(deleteBulk).toHaveBeenCalledWith("tag", { ids: ["id1"] });
   });
 });
 
@@ -486,14 +543,9 @@ describe("SupermemoryVolume.moveDoc", () => {
   function makeMoveClient() {
     const update = vi.fn().mockResolvedValue({ id: "doc-x", status: "done" });
     const client = {
-      documents: {
-        add: vi.fn(),
-        update,
-        get: vi.fn(),
-        delete: vi.fn(),
-        deleteBulk: vi.fn(),
-        list: vi.fn().mockResolvedValue(emptyListResp),
-      },
+      add: vi.fn(),
+      list: vi.fn().mockResolvedValue(emptyListResp),
+      documents: { update, get: vi.fn(), delete: vi.fn() },
     } as unknown as Supermemory;
     return { client, update };
   }
@@ -523,9 +575,12 @@ describe("SupermemoryVolume.moveDoc", () => {
     volume.cache.set("/old.md", "body", "done");
     await volume.moveDoc("/old.md", "/new.md");
     expect(update).toHaveBeenCalledTimes(1);
-    expect(update.mock.calls[0]?.[0]).toBe("doc-x");
-    const body = update.mock.calls[0]?.[1] as Record<string, unknown>;
-    expect(body.filepath).toBe("/new.md");
+    expect(update.mock.calls[0]?.[0]).toBe("tag");
+    expect(update.mock.calls[0]?.[1]).toBe("doc-x");
+    const body = update.mock.calls[0]?.[2] as Record<string, unknown>;
+    expect(update.mock.calls[0]?.[3]).toEqual({
+      additionalBodyParameters: { filepath: "/new.md" },
+    });
     expect(body.content).toBeUndefined(); // critical: no content on PATCH
     expect(volume.pathIndex.resolve("/old.md")).toBeNull();
     expect(volume.pathIndex.resolve("/new.md")).toBe("doc-x"); // SAME docId
@@ -536,21 +591,23 @@ describe("SupermemoryVolume.moveDoc", () => {
 
 function makeListClient(
   pages: Array<{
-    memories: Array<Record<string, unknown>>;
+    documents: Array<Record<string, unknown>>;
     pagination: { currentPage: number; totalPages: number; totalItems: number };
   }>,
 ) {
   const list = vi.fn().mockResolvedValue(emptyListResp);
-  for (const p of pages) list.mockResolvedValueOnce(p);
+  for (const p of pages)
+    list.mockResolvedValueOnce({
+      ...p,
+      documents: p.documents.map((d) => ({
+        ...d,
+        system: d.system ?? { filepath: d.filepath, status: d.status, updatedAt: d.updatedAt },
+      })),
+    });
   const client = {
-    documents: {
-      add: vi.fn(),
-      update: vi.fn(),
-      get: vi.fn(),
-      delete: vi.fn(),
-      deleteBulk: vi.fn(),
-      list,
-    },
+    add: vi.fn(),
+    list,
+    documents: { update: vi.fn(), get: vi.fn(), delete: vi.fn() },
   } as unknown as Supermemory;
   return { client, list };
 }
@@ -559,12 +616,15 @@ describe("SupermemoryVolume.listByPrefix / listAllPaths / statDoc", () => {
   it("listByPrefix filters out memories without filepath AND outside prefix; honors limit", async () => {
     const { client } = makeListClient([
       {
-        memories: [
-          { id: "1", filepath: "/notes/a.md", status: "done", updatedAt: "2026-01-01" },
+        documents: [
+          { id: "1", system: { filepath: "/notes/a.md", status: "done", updatedAt: "2026-01-01" } },
           { id: "2" }, // no filepath
-          { id: "3", filepath: "/other/b.md", status: "done", updatedAt: "2026-01-01" },
-          { id: "4", filepath: "/notes/c.md", status: "queued", updatedAt: "2026-01-01" },
-          { id: "5", filepath: "/notes/d.md", status: "done", updatedAt: "2026-01-01" },
+          { id: "3", system: { filepath: "/other/b.md", status: "done", updatedAt: "2026-01-01" } },
+          {
+            id: "4",
+            system: { filepath: "/notes/c.md", status: "queued", updatedAt: "2026-01-01" },
+          },
+          { id: "5", system: { filepath: "/notes/d.md", status: "done", updatedAt: "2026-01-01" } },
         ],
         pagination: { currentPage: 1, totalPages: 1, totalItems: 5 },
       },
@@ -585,7 +645,7 @@ describe("SupermemoryVolume.listByPrefix / listAllPaths / statDoc", () => {
         filepath: `/p${p}/${i}.md`,
       }));
       pages.push({
-        memories,
+        documents: memories,
         pagination: { currentPage: p, totalPages: 51, totalItems: 5100 },
       });
     }
@@ -597,7 +657,7 @@ describe("SupermemoryVolume.listByPrefix / listAllPaths / statDoc", () => {
   it("cachedAllPaths is empty before listAllPaths and populated after", async () => {
     const { client } = makeListClient([
       {
-        memories: [
+        documents: [
           { id: "1", filepath: "/a.md" },
           { id: "2", filepath: "/b.md" },
         ],
@@ -630,30 +690,25 @@ describe("SupermemoryVolume.search (hybrid mode)", () => {
           id: "mem-1",
           memory: "fact about plants",
           similarity: 0.9,
-          filepath: "/a.md",
-          documents: [{ id: "doc-1" }],
+          system: { filepath: "/a.md" },
+          included: { document: { id: "doc-1" } },
         },
         {
           id: "chunk-1",
           chunk: "raw chunk from doc-2",
           similarity: 0.7,
-          filepath: null,
-          documents: [{ id: "doc-2" }],
+          system: { filepath: null },
+          included: { document: { id: "doc-2" } },
         },
       ],
       total: 2,
       timing: 100,
     });
     const client = {
-      documents: {
-        add: vi.fn(),
-        update: vi.fn(),
-        get: vi.fn(),
-        delete: vi.fn(),
-        deleteBulk: vi.fn(),
-        list: vi.fn(),
-      },
-      search: { memories, execute: vi.fn() },
+      add: vi.fn(),
+      list: vi.fn(),
+      documents: { update: vi.fn(), get: vi.fn(), delete: vi.fn() },
+      search: memories,
     } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag");
     // PathIndex reverse-lookup to fill filepath when wire returns null.
@@ -661,16 +716,17 @@ describe("SupermemoryVolume.search (hybrid mode)", () => {
 
     const all = await volume.search({ q: "anything" });
     expect(memories).toHaveBeenCalledTimes(1);
-    expect(memories.mock.calls[0]?.[0]).toMatchObject({
-      q: "anything",
+    expect(memories.mock.calls[0]?.[0]).toBe("tag");
+    expect(memories.mock.calls[0]?.[1]).toMatchObject({
+      query: "anything",
       searchMode: "hybrid",
       include: { documents: true },
     });
     expect(all.results.length).toBe(2);
     expect(all.results[0]).toMatchObject({
       memory: "fact about plants",
-      filepath: "/a.md",
       similarity: 0.9,
+      filepath: "/a.md",
     });
     expect(all.results[1]).toMatchObject({
       chunk: "raw chunk from doc-2",
@@ -681,22 +737,29 @@ describe("SupermemoryVolume.search (hybrid mode)", () => {
   it("filters by filepath: prefix match when trailing slash, exact otherwise", async () => {
     const memories = vi.fn().mockResolvedValue({
       results: [
-        { id: "1", memory: "a", similarity: 0.9, filepath: "/notes/a.md", documents: [] },
-        { id: "2", memory: "b", similarity: 0.8, filepath: "/other/b.md", documents: [] },
+        {
+          id: "1",
+          memory: "a",
+          similarity: 0.9,
+          system: { filepath: "/notes/a.md" },
+          included: {},
+        },
+        {
+          id: "2",
+          memory: "b",
+          similarity: 0.8,
+          system: { filepath: "/other/b.md" },
+          included: {},
+        },
       ],
       total: 2,
       timing: 50,
     });
     const client = {
-      documents: {
-        add: vi.fn(),
-        update: vi.fn(),
-        get: vi.fn(),
-        delete: vi.fn(),
-        deleteBulk: vi.fn(),
-        list: vi.fn(),
-      },
-      search: { memories, execute: vi.fn() },
+      add: vi.fn(),
+      list: vi.fn(),
+      documents: { update: vi.fn(), get: vi.fn(), delete: vi.fn() },
+      search: memories,
     } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag");
 
@@ -712,17 +775,12 @@ describe("SupermemoryVolume.search (hybrid mode)", () => {
 
 describe("SupermemoryVolume.configureMemoryPaths", () => {
   it("skips PATCH when called twice with identical paths; re-issues for different paths", async () => {
-    const patch = vi.fn().mockResolvedValue(undefined);
+    const patch = vi.fn().mockResolvedValue({ count: 1, errors: [] });
     const client = {
-      documents: {
-        add: vi.fn(),
-        update: vi.fn(),
-        get: vi.fn(),
-        delete: vi.fn(),
-        deleteBulk: vi.fn(),
-        list: vi.fn(),
-      },
-      patch,
+      add: vi.fn(),
+      list: vi.fn(),
+      documents: { update: vi.fn(), get: vi.fn(), delete: vi.fn() },
+      namespaces: { update: patch },
     } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "my-tag");
     await volume.configureMemoryPaths(["/notes/", "/journal/"]);
@@ -740,28 +798,29 @@ describe("SupermemoryVolume — wire fallback on PathIndex miss (B2.13)", () => 
     // List response now carries content directly (includeContent:true is part
     // of the new cache-miss request shape).
     const list = vi.fn().mockResolvedValue({
-      memories: [{ id: "doc-z", filepath: "/cold.md", content: "found", status: "done" }],
+      documents: [
+        { id: "doc-z", content: "found", system: { filepath: "/cold.md", status: "done" } },
+      ],
       pagination: { currentPage: 1, totalPages: 1, totalItems: 1 },
     });
     const client = {
-      documents: {
-        add: vi.fn(),
-        update: vi.fn(),
-        get: vi.fn(),
-        list,
-        delete: vi.fn(),
-        deleteBulk: vi.fn(),
-      },
+      add: vi.fn(),
+      list,
+      documents: { update: vi.fn(), get: vi.fn(), delete: vi.fn() },
     } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag");
     const result = await volume.getDoc("/cold.md");
     expect(list).toHaveBeenCalledTimes(1);
-    expect(list.mock.calls[0]?.[0]).toMatchObject({
-      containerTags: ["tag"],
-      filepath: "/cold.md",
-      limit: 1,
-      includeContent: true,
-    });
+    expect(list).toHaveBeenCalledWith(
+      "tag",
+      "documents",
+      {
+        page: 1,
+        limit: 1,
+        include: { content: true },
+      },
+      { additionalBodyParameters: { filepath: "/cold.md" } },
+    );
     expect(result?.content).toBe("found");
     expect(volume.pathIndex.resolve("/cold.md")).toBe("doc-z");
   });
@@ -770,7 +829,9 @@ describe("SupermemoryVolume — wire fallback on PathIndex miss (B2.13)", () => 
     const list = vi.fn().mockResolvedValue(emptyListResp);
     const get = vi.fn();
     const client = {
-      documents: { add: vi.fn(), update: vi.fn(), get, list, delete: vi.fn(), deleteBulk: vi.fn() },
+      add: vi.fn(),
+      list,
+      documents: { update: vi.fn(), get, delete: vi.fn() },
     } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag");
     const result = await volume.getDoc("/never.md");
@@ -780,39 +841,32 @@ describe("SupermemoryVolume — wire fallback on PathIndex miss (B2.13)", () => 
 
   it("listByPrefix ships server-side filepath filter for prefix queries (not '/' or empty)", async () => {
     const list = vi.fn().mockResolvedValue({
-      memories: [{ id: "1", filepath: "/notes/a.md", status: "done", updatedAt: "2026-01-01" }],
+      documents: [
+        { id: "1", system: { filepath: "/notes/a.md", status: "done", updatedAt: "2026-01-01" } },
+      ],
       pagination: { currentPage: 1, totalPages: 1, totalItems: 1 },
     });
     const client = {
-      documents: {
-        add: vi.fn(),
-        update: vi.fn(),
-        get: vi.fn(),
-        delete: vi.fn(),
-        deleteBulk: vi.fn(),
-        list,
-      },
+      add: vi.fn(),
+      list,
+      documents: { update: vi.fn(), get: vi.fn(), delete: vi.fn() },
     } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag");
     await volume.listByPrefix("/notes/");
-    expect(list.mock.calls[0]?.[0]).toMatchObject({ filepath: "/notes/" });
+    expect(list.mock.calls[0]?.[3]).toEqual({ additionalBodyParameters: { filepath: "/notes/" } });
   });
 
   it("listByPrefix omits filepath when prefix is empty (full container)", async () => {
     const list = vi.fn().mockResolvedValue(emptyListResp);
     const client = {
-      documents: {
-        add: vi.fn(),
-        update: vi.fn(),
-        get: vi.fn(),
-        delete: vi.fn(),
-        deleteBulk: vi.fn(),
-        list,
-      },
+      add: vi.fn(),
+      list,
+      documents: { update: vi.fn(), get: vi.fn(), delete: vi.fn() },
     } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag");
     await volume.listByPrefix("");
-    const body = list.mock.calls[0]?.[0] as Record<string, unknown>;
+    const body = (list.mock.calls[0]?.[3] as { additionalBodyParameters: Record<string, unknown> })
+      .additionalBodyParameters;
     expect(body.filepath).toBeUndefined();
   });
 });
@@ -829,7 +883,13 @@ describe("formatProfile", () => {
 
   it("renders static-only profile with Core Knowledge section", () => {
     const out = formatProfile({
-      profile: { static: ["likes coffee", "lives in Austin"], dynamic: [] },
+      profile: {
+        static: [
+          { id: "profile-0", memory: "likes coffee" },
+          { id: "profile-1", memory: "lives in Austin" },
+        ],
+        dynamic: [],
+      },
     });
     expect(out).toContain("## Core Knowledge");
     expect(out).toContain("- likes coffee");
@@ -838,7 +898,9 @@ describe("formatProfile", () => {
   });
 
   it("renders dynamic-only profile with Recent Context section", () => {
-    const out = formatProfile({ profile: { static: [], dynamic: ["bought a drill press"] } });
+    const out = formatProfile({
+      profile: { static: [], dynamic: [{ id: "profile-0", memory: "bought a drill press" }] },
+    });
     expect(out).toContain("## Recent Context");
     expect(out).toContain("- bought a drill press");
     expect(out).not.toContain("## Core Knowledge");
@@ -846,7 +908,13 @@ describe("formatProfile", () => {
 
   it("renders both sections when both populated", () => {
     const out = formatProfile({
-      profile: { static: ["s1"], dynamic: ["d1", "d2"] },
+      profile: {
+        static: [{ id: "profile-0", memory: "s1" }],
+        dynamic: [
+          { id: "profile-0", memory: "d1" },
+          { id: "profile-1", memory: "d2" },
+        ],
+      },
     });
     expect(out.indexOf("## Core Knowledge")).toBeLessThan(out.indexOf("## Recent Context"));
     expect(out).toContain("- s1");
@@ -857,13 +925,18 @@ describe("formatProfile", () => {
 
 describe("SupermemoryVolume.fetchProfile", () => {
   it("calls client.profile with containerTag and caches the rendered body", async () => {
-    const profile = vi.fn().mockResolvedValue({ profile: { static: ["s"], dynamic: ["d"] } });
+    const profile = vi.fn().mockResolvedValue({
+      profile: {
+        static: [{ id: "profile-0", memory: "s" }],
+        dynamic: [{ id: "profile-0", memory: "d" }],
+      },
+    });
     const client = { profile } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag-x");
 
     const body = await volume.fetchProfile();
     expect(profile).toHaveBeenCalledTimes(1);
-    expect(profile).toHaveBeenCalledWith({ containerTag: "tag-x" });
+    expect(profile).toHaveBeenCalledWith("tag-x");
     expect(body).toContain("- s");
     expect(body).toContain("- d");
 
@@ -873,7 +946,9 @@ describe("SupermemoryVolume.fetchProfile", () => {
   });
 
   it("returns cached body without calling the SDK on second read", async () => {
-    const profile = vi.fn().mockResolvedValue({ profile: { static: ["s"], dynamic: [] } });
+    const profile = vi
+      .fn()
+      .mockResolvedValue({ profile: { static: [{ id: "profile-0", memory: "s" }], dynamic: [] } });
     const client = { profile } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag-x");
 
@@ -912,14 +987,9 @@ describe("SupermemoryVolume.addDoc validation pipeline", () => {
   function makeVolume() {
     const add = vi.fn().mockResolvedValue({ id: "new-id", status: "done" });
     const client = {
-      documents: {
-        add,
-        update: vi.fn(),
-        get: vi.fn(),
-        delete: vi.fn(),
-        deleteBulk: vi.fn(),
-        list: vi.fn().mockResolvedValue(emptyListResp),
-      },
+      add,
+      list: vi.fn().mockResolvedValue(emptyListResp),
+      documents: { update: vi.fn(), get: vi.fn(), delete: vi.fn() },
     } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag");
     return { volume, add };
@@ -963,14 +1033,9 @@ describe("SupermemoryVolume.moveDoc validation on dest", () => {
     const update = vi.fn().mockResolvedValue({ id: "new-id", status: "done" });
     const list = vi.fn().mockResolvedValue(emptyListResp);
     const client = {
-      documents: {
-        add: vi.fn(),
-        update,
-        get: vi.fn(),
-        delete: vi.fn(),
-        deleteBulk: vi.fn(),
-        list,
-      },
+      add: vi.fn(),
+      list,
+      documents: { update, get: vi.fn(), delete: vi.fn() },
     } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag");
     volume.pathIndex.insert("/parent.md", "doc-parent");
@@ -983,14 +1048,9 @@ describe("SupermemoryVolume.moveDoc validation on dest", () => {
     const update = vi.fn();
     const list = vi.fn().mockResolvedValue(emptyListResp);
     const client = {
-      documents: {
-        add: vi.fn(),
-        update,
-        get: vi.fn(),
-        delete: vi.fn(),
-        deleteBulk: vi.fn(),
-        list,
-      },
+      add: vi.fn(),
+      list,
+      documents: { update, get: vi.fn(), delete: vi.fn() },
     } as unknown as Supermemory;
     const volume = new SupermemoryVolume(client, "tag");
     volume.pathIndex.insert("/foo.md", "doc-foo");

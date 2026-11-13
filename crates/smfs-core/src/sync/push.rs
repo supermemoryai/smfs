@@ -218,7 +218,22 @@ async fn process_job(fs: &Arc<SupermemoryFs>, job: crate::cache::db::PushJob) {
                     }
                 }
             } else {
-                match api.create_document(&text, &job.filepath).await {
+                let create_id = match db.document_create_id(ino) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        db.push_queue_finalize_failure(
+                            &job.filepath,
+                            &error.to_string(),
+                            now_ms(),
+                            backoff_ms(job.attempt),
+                        );
+                        return;
+                    }
+                };
+                match api
+                    .create_document_with_id(&text, &job.filepath, Some(&create_id))
+                    .await
+                {
                     Ok(resp) => {
                         tracing::debug!(filepath = %job.filepath, remote_id = %resp.id, "push: POST ok");
                         db.set_remote_id(ino, &resp.id);

@@ -33,7 +33,6 @@ pub struct Document {
     pub url: Option<String>,
 }
 
-/// POST /ns/{namespace}/document
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateDocumentReq {
@@ -44,14 +43,12 @@ pub struct CreateDocumentReq {
     pub metadata: Option<MetadataMap>,
 }
 
-/// Response from POST /ns/{namespace}/document
 #[derive(Debug, Deserialize)]
 pub struct CreateDocumentResp {
     pub id: String,
     pub status: String,
 }
 
-/// PATCH /ns/{namespace}/document/{id}
 #[derive(Debug, Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateDocumentReq {
@@ -63,7 +60,6 @@ pub struct UpdateDocumentReq {
     pub metadata: Option<MetadataMap>,
 }
 
-/// POST /ns/{namespace}/list/documents
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListDocumentsReq {
@@ -80,7 +76,6 @@ pub struct ListDocumentsReq {
     pub order: Option<String>,
 }
 
-/// Response from POST /ns/{namespace}/list/documents
 #[derive(Debug, Deserialize)]
 pub struct ListDocumentsResp {
     #[serde(rename = "documents")]
@@ -88,7 +83,6 @@ pub struct ListDocumentsResp {
     pub pagination: Pagination,
 }
 
-/// Response from GET /ns/{namespace}/list/documents
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessingDocumentsResp {
@@ -106,7 +100,6 @@ pub struct Pagination {
     pub total_pages: u32,
 }
 
-/// DELETE /ns/{namespace}/document
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BulkDeleteReq {
@@ -118,7 +111,6 @@ pub struct BulkDeleteReq {
     pub filepath: Option<String>,
 }
 
-/// Response from DELETE /ns/{namespace}/document
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BulkDeleteResp {
@@ -126,12 +118,10 @@ pub struct BulkDeleteResp {
     pub deleted_count: u32,
 }
 
-/// POST /ns/{namespace}/profile
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileReq {}
 
-/// Response from POST /ns/{namespace}/profile
 #[derive(Debug, Deserialize)]
 pub struct ProfileResp {
     pub profile: Profile,
@@ -146,7 +136,6 @@ pub struct Profile {
     pub dynamic: Option<Vec<String>>,
 }
 
-/// POST /ns/{namespace}/search
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchReq {
@@ -162,7 +151,6 @@ pub struct SearchInclude {
     pub documents: bool,
 }
 
-/// Response from POST /ns/{namespace}/search
 #[derive(Debug, Deserialize)]
 pub struct SearchResp {
     pub results: Vec<SearchResult>,

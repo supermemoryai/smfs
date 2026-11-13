@@ -5,6 +5,7 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 from ._client import SupermemoryClient
 from ._errors import ebusy, eexist, efbig, eio, enoent
@@ -186,6 +187,7 @@ class SupermemoryVolume:
             else:
                 resp = await self.client.documents_add(self.container_tag, {
                     "content": content,
+                    "id": str(uuid4()),
                     "filepath": path,
                 })
                 doc_id = resp["id"]
