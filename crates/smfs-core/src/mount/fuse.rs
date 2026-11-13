@@ -30,10 +30,7 @@ use crate::vfs::{BoxedFile, FileAttr, FileSystem, FileType, SetAttr, TimeOrNow, 
 
 use super::{MountHandle, MountOpts};
 
-/// Attribute cache TTL. We use a long duration because the daemon is the
-/// only writer — there's no outside process that can invalidate the
-/// kernel's dcache, so entries never expire on their own.
-const TTL: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+const TTL: Duration = Duration::from_secs(1);
 
 // ─── Type conversion helpers ───────────────────────────────────────────────
 
@@ -169,7 +166,6 @@ impl<F: FileSystem + 'static> Filesystem for FuseAdapter<F> {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         let _ = config.add_capabilities(
             InitFlags::FUSE_ASYNC_READ
-                | InitFlags::FUSE_WRITEBACK_CACHE
                 | InitFlags::FUSE_PARALLEL_DIROPS
                 | InitFlags::FUSE_CACHE_SYMLINKS
                 | InitFlags::FUSE_NO_OPENDIR_SUPPORT,

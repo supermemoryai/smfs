@@ -2,7 +2,7 @@
 //!
 //! Four loops:
 //!
-//! - **Loop A — delta pull.** Every ~30s, walk `/v3/documents/list` sorted by
+//! - **Loop A — delta pull.** Every ~30s, walk `/ns/{namespace}/list/documents` sorted by
 //!   `updatedAt desc` and reconcile anything newer than our watermark into
 //!   the local cache.
 //! - **Loop C — deletion scan.** Every ~5min, diff the full remote ID set
@@ -11,7 +11,7 @@
 //! - **Loop D — push worker.** Claims queued push jobs from `push_queue`
 //!   and sends them; coalesces rapid writes to at most 2 server requests
 //!   per filepath (one inflight + one pending).
-//! - **Loop E — inflight poller.** Polls `GET /v3/documents/:id` for docs
+//! - **Loop E — inflight poller.** Polls `GET /ns/{namespace}/document/{id}` for docs
 //!   whose server-side processing hasn't flipped to `done` yet; updates
 //!   `mirrored_updated_at` and emits INFO/WARN/STOP tiers when stuck.
 

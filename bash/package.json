@@ -45,7 +45,7 @@
   },
   "peerDependencies": {
     "just-bash": "^2.14.0",
-    "supermemory": "^4.20.0"
+    "supermemory": "^5.0.0"
   },
   "devDependencies": {
     "@ai-sdk/anthropic": "^3.0.71",
@@ -57,7 +57,7 @@
     "ai": "^6.0.168",
     "just-bash": "^2.14.1",
     "openai": "^6.34.0",
-    "supermemory": "^4.20.0",
+    "supermemory": "^5.0.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0",
     "zod": "^4.3.6"

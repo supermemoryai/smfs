@@ -143,6 +143,19 @@ impl Db {
         Ok(())
     }
 
+    pub(crate) fn document_create_id(&self, ino: u64) -> rusqlite::Result<String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO fs_config (key, value) VALUES ('document_id_prefix', 'smfs-' || lower(hex(randomblob(16))))",
+            [],
+        )?;
+        conn.query_row(
+            "SELECT value || '-' || ?1 FROM fs_config WHERE key = 'document_id_prefix'",
+            [ino as i64],
+            |row| row.get(0),
+        )
+    }
+
     /// Look up the remote document ID for an inode, if one has been stored.
     pub(crate) fn get_remote_id(&self, ino: u64) -> Option<String> {
         let conn = self.conn.lock();

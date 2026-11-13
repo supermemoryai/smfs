@@ -268,8 +268,8 @@ impl crate::vfs::File for SqliteFile {
         // Update inode size + timestamps.
         let now = Timestamp::now();
         tx.execute(
-            "UPDATE fs_inode SET size = ?1, mtime = ?2, mtime_nsec = ?3, ctime = ?4, ctime_nsec = ?5 WHERE ino = ?6",
-            rusqlite::params![size as i64, now.sec, now.nsec, now.sec, now.nsec, self.ino as i64],
+            "UPDATE fs_inode SET size = ?1, mtime = ?2, mtime_nsec = ?3, ctime = ?4, ctime_nsec = ?5, dirty_since = ?6 WHERE ino = ?7",
+            rusqlite::params![size as i64, now.sec, now.nsec, now.sec, now.nsec, now_ms(), self.ino as i64],
         )
         .map_err(|e| VfsError::Io(std::io::Error::other(e.to_string())))?;
 
@@ -284,7 +284,7 @@ impl crate::vfs::File for SqliteFile {
         // If we have an API client and a filepath, enqueue a push op so the
         // background worker can coalesce rapid saves into at most one
         // inflight + one pending request per filepath.
-        if self.api.is_none() {
+        if self.api.is_none() || self.db.get_dirty_since(self.ino).is_none() {
             return Ok(());
         }
         let Some(filepath) = &self.filepath else {

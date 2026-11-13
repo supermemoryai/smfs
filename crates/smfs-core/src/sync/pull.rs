@@ -1,6 +1,6 @@
 //! Pull side of the sync engine.
 //!
-//! Walks `/v3/documents/list` sorted by `updatedAt desc`, paginating until we
+//! Walks `/ns/{namespace}/list/documents` sorted by `updatedAt desc`, paginating until we
 //! reach a doc whose `updatedAt` is older than what we already know about.
 //! Each returned doc is handed to [`SupermemoryFs::reconcile_one`] which
 //! handles creation, rename, content rewrite, and dirty-priority skipping.

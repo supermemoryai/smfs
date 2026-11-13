@@ -12,6 +12,7 @@ Two access flows depending on the runtime:
 
 ## Contents
 
+- [API v5 compatibility](#api-v5-compatibility)
 - [Install](#install)
 - [Quickstart](#quickstart)
 - [Memory generation paths](#memory-generation-paths)
@@ -22,6 +23,53 @@ Two access flows depending on the runtime:
 - [Build from source](#build-from-source)
 - [Docker and devcontainers](#docker-and-devcontainers)
 - [License](#license)
+
+## API v5 compatibility
+
+This checkout uses the namespace-scoped v5 API for documents, uploads, lists,
+search, profiles and memory-path settings. The existing mount argument is the
+namespace: `smfs mount agent_memory` still targets `agent_memory`. Do not rename
+it or switch to `sm_project_default` when upgrading an existing mount.
+
+Unmount cleanly and let pending writes drain before replacing the binary. Keep
+its existing cache and credentials; this change does not wipe the cache, re-import
+data or change namespace identities. Old cached document IDs are checked before deletion
+reconciliation and retained as local aliases when v5 returns a caller-defined
+ID. Cached IDs are resolved once per mount before list-driven synchronization. An
+unresolved check leaves synchronization unavailable rather than guessing a
+deletion; the existing offline-mount behavior is retained.
+On a fresh mount, documents without a filesystem path use their public v5 ID
+for the synthesized filename. The cache alias path is intended to preserve
+existing cached names. A live Linux upgrade from the previous v4 binary retained
+the original cache and internal document ID and replayed a queued offline edit.
+
+The filesystem-specific `filepath` and `memoryFilesystemPaths` fields remain
+supported by the API but are hidden from its public SDK types. SMFS retains
+these fields, including existing server-side collision and memory-path rules;
+it does not move paths into metadata or rewrite stored documents. Authentication
+still uses the supported `/v3/session` route, not an invented v5 auth endpoint.
+
+The TypeScript bash package requires the `supermemory` **5.x** SDK; SDK 4.x is no
+longer compatible. Its `namespace` option is preferred; `containerTag` remains
+accepted for existing callers. Python accepts `namespace` while retaining
+`container_tag`. Supply the same existing value. Self-hosted servers must support
+v5 (server v0.0.9 or later); there is no automatic fallback to legacy data routes.
+Namespace names must meet v5's 1–100-character alphanumeric, underscore, colon or
+hyphen constraint. Incompatible legacy names are rejected, never silently renamed.
+
+There is no v5 processing-list or filepath bulk-delete endpoint. The daemon polls
+only tracked documents, with at most eight requests in flight. Directory deletes
+first collect matching IDs, then delete batches of at most 100, checking per-ID
+errors. Successful deletions are not rolled back when another item fails.
+Directory deletion is a snapshot, not an atomic transaction with concurrent
+remote renames; avoid other writers while deleting a tree.
+
+New text files receive explicit v5 IDs so identical-content copies remain
+separate documents. The native daemon keeps creation IDs stable across retries
+and restarts using its existing cache, without rewriting old remote IDs.
+
+Building this checkout does not update published binaries or packages. Release
+publication is a separate step.
 
 ## Install
 
@@ -135,7 +183,7 @@ import { createBash } from "@supermemory/bash";
 
 const { bash, toolDescription } = await createBash({
   apiKey: process.env.SUPERMEMORY_API_KEY!,
-  containerTag: "user_42",
+  namespace: "user_42",
 });
 
 await bash.exec("echo 'hello' > /a.md && cat /a.md");
