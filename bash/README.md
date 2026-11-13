@@ -28,7 +28,7 @@ import { createBash } from "@supermemory/bash";
 
 const { bash, toolDescription } = await createBash({
   apiKey: process.env.SUPERMEMORY_API_KEY!,
-  containerTag: "user_42",
+  namespace: "user_42",
 });
 
 // Run any shell command:
@@ -68,7 +68,7 @@ import { createBash } from "@supermemory/bash";
 
 const { bash, toolDescription } = await createBash({
   apiKey: process.env.SUPERMEMORY_API_KEY!,
-  containerTag: "user_42",
+  namespace: "user_42",
 });
 
 const result = await generateText({
@@ -93,7 +93,7 @@ import { createBash } from "@supermemory/bash";
 
 const { bash, toolDescription } = await createBash({
   apiKey: process.env.SUPERMEMORY_API_KEY!,
-  containerTag: "user_42",
+  namespace: "user_42",
 });
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
@@ -116,7 +116,7 @@ const response = await client.messages.create({
 ```typescript
 createBash({
   apiKey: string,
-  containerTag: string,         // one container per user / project
+  namespace: string,         // one container per user / project
   baseURL?: string,             // SDK override
   eagerLoad?: boolean,          // default: true (warm pathIndex at construction)
   eagerContent?: boolean,       // default: true (also warm content cache)
@@ -141,3 +141,19 @@ For very large containers (10k+ docs), set `eagerContent: false` to skip the con
 ## License
 
 MIT
+
+## API v5 upgrade
+
+Use `supermemory` 5.x with this checkout. `namespace` replaces `containerTag` in
+new `createBash` calls; existing `containerTag` callers still work. If both are
+supplied, they must match. `SupermemoryVolume(client, namespace)` retains its
+positional constructor, and its `containerTag` property still exposes that same
+namespace for compatibility. Existing `baseURL` options are forwarded to the
+v5 SDK as `baseUrl`.
+
+Keep your existing namespace value to retain access to the same documents.
+Lists read `documents` and `system` fields, search reads `included.document`, and
+profiles render each returned memory's text. Filesystem paths and memory-path
+settings use the API's hidden filesystem fields through SDK request extensions.
+Prefix deletion snapshots IDs before deletion and reports partial failures;
+it never sends the removed filepath bulk-delete request.

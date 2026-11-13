@@ -10,7 +10,7 @@
 //!
 //! - **Loop E — inflight status poller.** For every doc we've POSTed whose
 //!   `fs_remote.last_status` hasn't reached `done` yet, periodically
-//!   `GET /v3/documents/:id` on an age-bucketed cadence. Updates
+//!   `GET /ns/{namespace}/document/{id}` on an age-bucketed cadence. Updates
 //!   `mirrored_updated_at` when status flips to `done` so the pull
 //!   reconciler's watermark stays honest. Logs INFO/WARN/STOP tiers for
 //!   stuck-processing detection.
@@ -444,11 +444,7 @@ fn stuck_tier(age_ms: i64) -> StuckTier {
     }
 }
 
-/// Run loop E: the inflight status poller. One
-/// `GET /v3/documents/processing` per tick — regardless of how many
-/// docs are currently in flight — tells us the set of still-processing
-/// ids. Anything local that's no longer in that set has reached a
-/// terminal state; we issue a per-id GET only in that transition case.
+/// Poll tracked document states with at most eight concurrent v5 requests.
 pub async fn run_inflight_poller(fs: Arc<SupermemoryFs>, mut shutdown: watch::Receiver<bool>) {
     if fs.api().is_none() {
         return;
@@ -468,7 +464,8 @@ pub async fn run_inflight_poller(fs: Arc<SupermemoryFs>, mut shutdown: watch::Re
             continue;
         }
 
-        let processing = match api.get_processing_documents().await {
+        let ids: Vec<&str> = rows.iter().map(|row| row.remote_id.as_str()).collect();
+        let processing = match api.get_document_states(&ids).await {
             Ok(docs) => {
                 tracing::debug!(
                     returned = docs.len(),
@@ -521,7 +518,10 @@ pub async fn run_inflight_poller(fs: Arc<SupermemoryFs>, mut shutdown: watch::Re
                 StuckTier::Ok => {}
             }
 
-            if let Some(doc) = processing_map.get(row.remote_id.as_str()) {
+            if let Some(doc) = processing_map
+                .get(row.remote_id.as_str())
+                .filter(|doc| doc.status != "done" && doc.status != "failed")
+            {
                 // Still in the processing list — update status; mirrored_at
                 // stays unchanged (we only advance it when done is confirmed).
                 db.set_mirrored_state(row.ino, None, Some(&doc.status), Some(now));

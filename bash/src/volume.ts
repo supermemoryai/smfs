@@ -1,20 +1,30 @@
 import type Supermemory from "supermemory";
-import type { DocumentListResponse } from "supermemory/resources/documents";
-import type { SearchMemoriesParams } from "supermemory/resources/search";
-import type { ProfileResponse } from "supermemory/resources/top-level";
 import { ebusy, eexist, efbig, eio, enoent } from "./errors.js";
 import { PathIndex } from "./path-index.js";
 import { SessionCache, type SessionCacheOptions } from "./session-cache.js";
 import { assertWritable } from "./validation/pipeline.js";
 
-// SDK's Memory type omits `filepath` and the per-status error fields.
-type MemoryWithPath = DocumentListResponse.Memory & {
+type ProfileResponse = Awaited<ReturnType<Supermemory["profile"]>>;
+type WireDocument = Awaited<ReturnType<Supermemory["list"]>>["documents"][number];
+type MemoryWithPath = WireDocument & {
   filepath?: string;
+  status: string;
+  updatedAt: string;
   errorMessage?: string;
   errorReason?: string;
   error?: string;
   failureReason?: string;
 };
+
+function documentWithPath(doc: WireDocument): MemoryWithPath {
+  const system = doc.system as WireDocument["system"] & { filepath?: string | null };
+  return {
+    ...doc,
+    filepath: system.filepath ?? undefined,
+    status: system.status,
+    updatedAt: system.updatedAt,
+  };
+}
 
 function normalizeStatus(s: string): DocStatus {
   if (s === "done") return "done";
@@ -104,6 +114,23 @@ export class SupermemoryVolume {
     this.cache = options.cache ?? new SessionCache(options.cacheOptions);
   }
 
+  private async listDocuments(params: Record<string, unknown>) {
+    const response = await this.client.list(
+      this.containerTag,
+      "documents",
+      {
+        page: params.page as number,
+        limit: params.limit as number,
+        include: { content: params.includeContent === true },
+      },
+      {
+        additionalBodyParameters:
+          params.filepath === undefined ? {} : { filepath: params.filepath },
+      },
+    );
+    return { memories: response.documents.map(documentWithPath), pagination: response.pagination };
+  }
+
   private async *iterContainer(
     opts: { filepath?: string; includeContent?: boolean } = {},
   ): AsyncIterable<MemoryWithPath> {
@@ -111,15 +138,12 @@ export class SupermemoryVolume {
     const includeContent = opts.includeContent ?? false;
     while (true) {
       const params: Record<string, unknown> = {
-        containerTags: [this.containerTag],
         limit: 100,
         page,
         includeContent,
       };
       if (opts.filepath !== undefined) params.filepath = opts.filepath;
-      const resp = await this.client.documents.list(
-        params as Parameters<typeof this.client.documents.list>[0],
-      );
+      const resp = await this.listDocuments(params);
       for (const m of resp.memories ?? []) yield m as MemoryWithPath;
       const total = resp.pagination?.totalPages ?? 1;
       if (page >= total) break;
@@ -131,11 +155,9 @@ export class SupermemoryVolume {
     const cached = this.pathIndex.resolve(path);
     if (cached) return cached;
     try {
-      const resp = await this.client.documents.list({
-        containerTags: [this.containerTag],
+      const resp = await this.listDocuments({
         limit: 1,
         page: 1,
-        // @ts-expect-error filepath not in DocumentListParams typing yet (wire accepts it; exact match without trailing slash)
         filepath: path,
       });
       const m = resp.memories?.[0] as MemoryWithPath | undefined;
@@ -171,21 +193,24 @@ export class SupermemoryVolume {
 
     try {
       if (existing) {
-        const resp = await this.client.documents.update(existing, {
-          content,
-          containerTag: this.containerTag,
-          // @ts-expect-error filepath not in DocumentUpdateParams typing yet
-          filepath: path,
-        });
+        const resp = await this.client.documents.update(
+          this.containerTag,
+          existing,
+          {
+            content,
+          },
+          { additionalBodyParameters: { filepath: path } },
+        );
         id = resp.id ?? existing;
         serverStatus = resp.status ?? "unknown";
       } else {
-        const resp = await this.client.documents.add({
-          content,
-          containerTag: this.containerTag,
-          // @ts-expect-error filepath not in DocumentAddParams typing yet
-          filepath: path,
-        });
+        const resp = await this.client.add(
+          this.containerTag,
+          {
+            content,
+          },
+          { additionalBodyParameters: { filepath: path } },
+        );
         id = resp.id;
         serverStatus = resp.status;
       }
@@ -218,12 +243,10 @@ export class SupermemoryVolume {
 
     let resp: { memories?: MemoryWithPath[] };
     try {
-      resp = await this.client.documents.list({
-        containerTags: [this.containerTag],
+      resp = await this.listDocuments({
         limit: 1,
         page: 1,
         includeContent: true,
-        // @ts-expect-error filepath not in DocumentListParams typing yet (wire accepts it)
         filepath: path,
       });
     } catch (err) {
@@ -257,9 +280,17 @@ export class SupermemoryVolume {
     if (!docId) return;
 
     try {
-      await this.client.documents.delete(docId);
+      const result = await this.client.documents.delete(this.containerTag, { ids: [docId] });
+      if (result.errors.length > 0) {
+        if (result.errors.every((error) => error.error === "Document not found")) {
+          this.pathIndex.remove(path);
+          this.cache.delete(path);
+          return;
+        }
+        throw Object.assign(ebusy(path), { statusCode: 409 });
+      }
     } catch (err) {
-      const status = (err as { status?: number }).status;
+      const status = (err as { statusCode?: number }).statusCode;
       if (status === 409) throw ebusy(path);
       if (status === 404) {
         this.pathIndex.remove(path);
@@ -274,38 +305,7 @@ export class SupermemoryVolume {
   }
 
   async removeByPrefix(prefix: string): Promise<RemoveByPrefixResult> {
-    const filterArg = this.filterArgFor(prefix, false);
-    if (filterArg === undefined) {
-      // Empty prefix would also wipe filepath-NULL docs; iterate so we only touch the ones we model.
-      return this.removeByPrefixViaList(prefix);
-    }
-
-    let deleted = 0;
-    const errors: Error[] = [];
-    try {
-      const resp = await this.client.documents.deleteBulk({
-        containerTags: [this.containerTag],
-        // @ts-expect-error filepath not in DocumentDeleteBulkParams typing yet (wire accepts it)
-        filepath: filterArg,
-      });
-      deleted = resp.deletedCount ?? 0;
-      for (const e of resp.errors ?? []) {
-        errors.push(new Error(`${e.id}: ${e.error}`));
-      }
-    } catch (err) {
-      errors.push(new Error(`removeByPrefix(${prefix}): ${(err as Error).message}`));
-      return { deleted, errors };
-    }
-
-    for (const p of this.pathIndex.paths()) {
-      if (p.startsWith(prefix)) {
-        this.pathIndex.remove(p);
-        this.cache.delete(p);
-      }
-    }
-    this.evictSyntheticUnder(prefix);
-
-    return { deleted, errors };
+    return this.removeByPrefixViaList(this.filterArgFor(prefix, false) ?? prefix);
   }
 
   private evictSyntheticUnder(prefix: string): void {
@@ -330,9 +330,11 @@ export class SupermemoryVolume {
     for (let i = 0; i < matches.length; i += 100) {
       const batch = matches.slice(i, i + 100);
       try {
-        const resp = await this.client.documents.deleteBulk({ ids: batch.map((m) => m.id) });
-        deleted += resp.deletedCount ?? 0;
-        for (const e of resp.errors ?? []) {
+        const resp = await this.client.documents.delete(this.containerTag, {
+          ids: batch.map((m) => m.id),
+        });
+        deleted += resp.count;
+        for (const e of resp.errors.filter((error) => error.error !== "Document not found")) {
           errors.push(new Error(`${e.id}: ${e.error}`));
         }
       } catch (err) {
@@ -363,13 +365,14 @@ export class SupermemoryVolume {
 
     // PATCH with filepath only (no content) renames; PATCH with content silently ignores filepath.
     try {
-      await this.client.documents.update(docId, {
-        containerTag: this.containerTag,
-        // @ts-expect-error filepath not in DocumentUpdateParams typing yet
-        filepath: to,
-      });
+      await this.client.documents.update(
+        this.containerTag,
+        docId,
+        {},
+        { additionalBodyParameters: { filepath: to } },
+      );
     } catch (err) {
-      const status = (err as { status?: number }).status;
+      const status = (err as { statusCode?: number }).statusCode;
       if (status === 404) {
         this.pathIndex.remove(from);
         this.cache.delete(from);
@@ -465,12 +468,10 @@ export class SupermemoryVolume {
 
     let resp: { memories?: MemoryWithPath[] };
     try {
-      resp = await this.client.documents.list({
-        containerTags: [this.containerTag],
+      resp = await this.listDocuments({
         limit: 1,
         page: 1,
         includeContent: true,
-        // @ts-expect-error filepath not in DocumentListParams typing yet (wire accepts it)
         filepath: path,
       });
     } catch (err) {
@@ -573,14 +574,18 @@ export class SupermemoryVolume {
   async search(params: SearchParams): Promise<SearchResp> {
     let resp: { results?: unknown[] };
     try {
-      const body: SearchMemoriesParams & { filepath?: string } = {
-        q: params.q,
-        containerTag: this.containerTag,
-        searchMode: "hybrid",
-        include: { documents: true },
-      };
-      if (params.filepath !== undefined) body.filepath = params.filepath;
-      resp = await this.client.search.memories(body);
+      resp = await this.client.search(
+        this.containerTag,
+        {
+          query: params.q,
+          searchMode: "hybrid",
+          include: { documents: true },
+        },
+        {
+          additionalBodyParameters:
+            params.filepath === undefined ? {} : { filepath: params.filepath },
+        },
+      );
     } catch (err) {
       throw eio(`search(${params.q}): ${(err as Error).message}`);
     }
@@ -592,13 +597,13 @@ export class SupermemoryVolume {
         memory?: string;
         chunk?: string;
         similarity?: number;
-        filepath?: string | null;
-        documents?: Array<{ id?: string; documentId?: string }>;
+        system: { filepath?: string | null };
+        included?: { document?: { id: string } };
       };
-      const docId = rec.documents?.[0]?.id ?? rec.documents?.[0]?.documentId ?? rec.id;
+      const docId = rec.included?.document?.id ?? rec.id;
       // Old containers return a null filepath; reverse-lookup via PathIndex covers that.
       const filepath =
-        (typeof rec.filepath === "string" ? rec.filepath : undefined) ??
+        (typeof rec.system.filepath === "string" ? rec.system.filepath : undefined) ??
         (docId ? (this.pathIndex.findPath(docId) ?? undefined) : undefined);
       if (params.filepath) {
         const wantsPrefix = params.filepath.endsWith("/");
@@ -626,7 +631,7 @@ export class SupermemoryVolume {
 
     let resp: ProfileResponse;
     try {
-      resp = await this.client.profile({ containerTag: this.containerTag });
+      resp = await this.client.profile(this.containerTag);
     } catch (err) {
       throw eio(`profile: ${(err as Error).message}`);
     }
@@ -644,9 +649,13 @@ export class SupermemoryVolume {
     if (this.lastConfiguredPaths === key) return;
 
     try {
-      await this.client.patch(`/v3/container-tags/${encodeURIComponent(this.containerTag)}`, {
-        body: { memoryFilesystemPaths: paths },
-      });
+      await this.client.namespaces.update(
+        this.containerTag,
+        {},
+        {
+          additionalBodyParameters: { memoryFilesystemPaths: paths },
+        },
+      );
     } catch (err) {
       throw eio(`configureMemoryPaths: ${(err as Error).message}`);
     }
@@ -669,11 +678,11 @@ export function formatProfile(resp: ProfileResponse): string {
   const parts: string[] = [PROFILE_HEADER];
   if (staticItems.length > 0) {
     parts.push("\n## Core Knowledge\n");
-    for (const item of staticItems) parts.push(`- ${item}\n`);
+    for (const item of staticItems) parts.push(`- ${item.memory}\n`);
   }
   if (dynamicItems.length > 0) {
     parts.push("\n## Recent Context\n");
-    for (const item of dynamicItems) parts.push(`- ${item}\n`);
+    for (const item of dynamicItems) parts.push(`- ${item.memory}\n`);
   }
   return parts.join("");
 }

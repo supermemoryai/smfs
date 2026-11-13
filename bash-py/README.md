@@ -30,7 +30,7 @@ from supermemory_bash import create_bash
 async def main():
     result = await create_bash(
         api_key="sm-...",
-        container_tag="user_42",
+        namespace="user_42",
     )
     bash = result.bash
 
@@ -70,7 +70,7 @@ The agent gets:
 from openai import AsyncOpenAI
 from supermemory_bash import create_bash
 
-result = await create_bash(api_key="sm-...", container_tag="user_42")
+result = await create_bash(api_key="sm-...", namespace="user_42")
 
 client = AsyncOpenAI()
 response = await client.chat.completions.create(
@@ -99,7 +99,7 @@ response = await client.chat.completions.create(
 from anthropic import AsyncAnthropic
 from supermemory_bash import create_bash
 
-result = await create_bash(api_key="sm-...", container_tag="user_42")
+result = await create_bash(api_key="sm-...", namespace="user_42")
 
 client = AsyncAnthropic()
 response = await client.messages.create(
@@ -125,7 +125,7 @@ response = await client.messages.create(
 ```python
 await create_bash(
     api_key="sm-...",
-    container_tag="user_42",        # one container per user / project
+    namespace="user_42",        # one container per user / project
     base_url=None,                  # API override
     eager_load=True,                # default: True (warm path_index at construction)
     eager_content=True,             # default: True (also warm content cache)
@@ -148,3 +148,17 @@ For very large containers (10k+ docs), set `eager_content=False` to skip the con
 ## License
 
 MIT
+
+## API v5 upgrade
+
+This checkout uses namespace-scoped v5 data routes. Pass `namespace` to
+`create_bash`; the existing positional argument and `container_tag` keyword remain
+accepted, and conflicting values are rejected. Keep the same namespace value
+and base URL. No data re-import is required. Low-level `SupermemoryClient`
+methods now take the namespace first, separately from request options.
+
+Document state and paths come from `system`, profile items are rendered as
+memory text, and search resolves source IDs from `included.document`. Directory
+deletes snapshot matching document IDs and submit batches of at most 100,
+retaining per-ID errors. The filesystem path and memory-path configuration
+fields remain in their supported server fields, not metadata.

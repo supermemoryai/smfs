@@ -11,7 +11,8 @@ type ExecutionLimits = NonNullable<BashOptions["executionLimits"]>;
 
 export interface CreateBashOptions {
   apiKey: string;
-  containerTag: string;
+  namespace?: string;
+  containerTag?: string;
   baseURL?: string;
   /** Warm PathIndex at construction. Default true. */
   eagerLoad?: boolean;
@@ -45,11 +46,16 @@ export interface CreateBashResult {
 }
 
 export async function createBash(opts: CreateBashOptions): Promise<CreateBashResult> {
+  if (opts.namespace && opts.containerTag && opts.namespace !== opts.containerTag) {
+    throw new Error("namespace and containerTag must identify the same namespace");
+  }
+  const namespace = opts.namespace ?? opts.containerTag;
+  if (!namespace) throw new Error("namespace is required");
   const client = new Supermemory({
     apiKey: opts.apiKey,
-    ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
+    ...(opts.baseURL ? { baseUrl: opts.baseURL } : {}),
   });
-  const volume = new SupermemoryVolume(client, opts.containerTag, {
+  const volume = new SupermemoryVolume(client, namespace, {
     cacheOptions: opts.cacheTtlMs === undefined ? undefined : { ttlMs: opts.cacheTtlMs },
   });
   const fs = new SupermemoryFs(volume);

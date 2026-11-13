@@ -91,6 +91,16 @@ async fn deletion_scan_inner(
     let mut removed = 0usize;
     for id in local_ids {
         if !remote_ids.contains(&id) {
+            match api.get_document(&id).await {
+                Ok(doc) => {
+                    api.retain_document_id(&doc.id, &id);
+                    continue;
+                }
+                Err(crate::api::ApiError::NotFound) => {}
+                Err(error) => {
+                    return Err(anyhow::anyhow!("deletion identity check failed: {error}"))
+                }
+            }
             if let Ok(true) = fs.apply_deletion(&id) {
                 removed += 1;
             }

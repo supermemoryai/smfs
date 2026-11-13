@@ -52,6 +52,13 @@ impl SupermemoryFs {
 
     /// Create a `SupermemoryFs` with an API client for cloud sync.
     pub fn with_api(db: Arc<Db>, api: Arc<crate::api::ApiClient>) -> Self {
+        let cached_ids = (|| -> rusqlite::Result<Vec<String>> {
+            let conn = db.conn.lock();
+            let mut statement = conn.prepare("SELECT remote_id FROM fs_remote")?;
+            let rows = statement.query_map([], |row| row.get(0))?;
+            rows.collect()
+        })();
+        api.set_cached_document_ids(cached_ids.map_err(|error| error.to_string()));
         let profile_file = Arc::new(ProfileFile::new(api.clone()));
         Self {
             db,

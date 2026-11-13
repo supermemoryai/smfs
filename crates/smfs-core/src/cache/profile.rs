@@ -1,4 +1,4 @@
-//! Virtual read-only `profile.md` backed by the `POST /v4/profile` API.
+//! Virtual read-only `profile.md` backed by the `POST /ns/{namespace}/profile` API.
 
 use std::sync::Arc;
 

@@ -12,7 +12,7 @@ pub type MetadataMap = HashMap<String, serde_json::Value>;
 
 /// A document returned by the Supermemory API.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(from = "NamespaceDocument")]
 pub struct Document {
     pub id: String,
     pub filepath: Option<String>,
@@ -26,7 +26,6 @@ pub struct Document {
     pub updated_at: String,
     #[serde(default)]
     pub metadata: Option<MetadataMap>,
-    #[serde(default, rename = "type")]
     pub type_: Option<String>,
     /// R2 URL for binary docs; null for plain text. Used to rehydrate raw
     /// files on a clean remount.
@@ -34,26 +33,25 @@ pub struct Document {
     pub url: Option<String>,
 }
 
-/// POST /v3/documents
+/// POST /ns/{namespace}/document
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateDocumentReq {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filepath: Option<String>,
-    pub container_tag: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<MetadataMap>,
 }
 
-/// Response from POST /v3/documents
+/// Response from POST /ns/{namespace}/document
 #[derive(Debug, Deserialize)]
 pub struct CreateDocumentResp {
     pub id: String,
     pub status: String,
 }
 
-/// PATCH /v3/documents/:id
+/// PATCH /ns/{namespace}/document/{id}
 #[derive(Debug, Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateDocumentReq {
@@ -65,7 +63,7 @@ pub struct UpdateDocumentReq {
     pub metadata: Option<MetadataMap>,
 }
 
-/// POST /v3/documents/list
+/// POST /ns/{namespace}/list/documents
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListDocumentsReq {
@@ -82,14 +80,15 @@ pub struct ListDocumentsReq {
     pub order: Option<String>,
 }
 
-/// Response from POST /v3/documents/list
+/// Response from POST /ns/{namespace}/list/documents
 #[derive(Debug, Deserialize)]
 pub struct ListDocumentsResp {
+    #[serde(rename = "documents")]
     pub memories: Vec<Document>,
     pub pagination: Pagination,
 }
 
-/// Response from GET /v3/documents/processing
+/// Response from GET /ns/{namespace}/list/documents
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessingDocumentsResp {
@@ -101,12 +100,13 @@ pub struct ProcessingDocumentsResp {
 #[serde(rename_all = "camelCase")]
 pub struct Pagination {
     pub current_page: u32,
+    #[serde(default)]
     pub limit: u32,
     pub total_items: u32,
     pub total_pages: u32,
 }
 
-/// DELETE /v3/documents/bulk
+/// DELETE /ns/{namespace}/document
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BulkDeleteReq {
@@ -118,7 +118,7 @@ pub struct BulkDeleteReq {
     pub filepath: Option<String>,
 }
 
-/// Response from DELETE /v3/documents/bulk
+/// Response from DELETE /ns/{namespace}/document
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BulkDeleteResp {
@@ -126,14 +126,12 @@ pub struct BulkDeleteResp {
     pub deleted_count: u32,
 }
 
-/// POST /v4/profile
+/// POST /ns/{namespace}/profile
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ProfileReq {
-    pub container_tag: String,
-}
+pub struct ProfileReq {}
 
-/// Response from POST /v4/profile
+/// Response from POST /ns/{namespace}/profile
 #[derive(Debug, Deserialize)]
 pub struct ProfileResp {
     pub profile: Profile,
@@ -142,16 +140,17 @@ pub struct ProfileResp {
 #[derive(Debug, Deserialize)]
 pub struct Profile {
     #[serde(rename = "static")]
+    #[serde(deserialize_with = "profile_text")]
     pub static_memories: Option<Vec<String>>,
+    #[serde(deserialize_with = "profile_text")]
     pub dynamic: Option<Vec<String>>,
 }
 
-/// POST /v4/search
+/// POST /ns/{namespace}/search
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchReq {
-    pub q: String,
-    pub container_tag: String,
+    pub query: String,
     pub search_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filepath: Option<String>,
@@ -163,19 +162,127 @@ pub struct SearchInclude {
     pub documents: bool,
 }
 
-/// Response from POST /v4/search
+/// Response from POST /ns/{namespace}/search
 #[derive(Debug, Deserialize)]
 pub struct SearchResp {
     pub results: Vec<SearchResult>,
+    #[serde(rename = "searchTime")]
     pub timing: Option<f64>,
     pub total: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(from = "NamespaceSearchResult")]
 pub struct SearchResult {
     pub id: String,
     pub memory: Option<String>,
     pub chunk: Option<String>,
     pub similarity: f64,
     pub filepath: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NamespaceSystem {
+    status: String,
+    created_at: String,
+    updated_at: String,
+    filepath: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NamespaceDocument {
+    id: String,
+    title: Option<String>,
+    summary: Option<String>,
+    content: Option<String>,
+    metadata: Option<MetadataMap>,
+    #[serde(rename = "type")]
+    type_: Option<String>,
+    url: Option<String>,
+    system: NamespaceSystem,
+}
+
+impl From<NamespaceDocument> for Document {
+    fn from(doc: NamespaceDocument) -> Self {
+        Self {
+            id: doc.id,
+            filepath: doc.system.filepath,
+            custom_id: None,
+            title: doc.title,
+            summary: doc.summary,
+            content: doc.content,
+            status: doc.system.status,
+            container_tags: None,
+            created_at: doc.system.created_at,
+            updated_at: doc.system.updated_at,
+            metadata: doc.metadata,
+            type_: doc.type_,
+            url: doc.url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct NamespaceSearchResult {
+    id: String,
+    memory: Option<String>,
+    chunk: Option<String>,
+    similarity: f64,
+    system: SearchSystem,
+    included: Option<SearchIncluded>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchSystem {
+    filepath: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchIncluded {
+    document: Option<SearchDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchDocument {
+    id: String,
+}
+
+impl From<NamespaceSearchResult> for SearchResult {
+    fn from(result: NamespaceSearchResult) -> Self {
+        Self {
+            id: result
+                .included
+                .and_then(|i| i.document)
+                .map(|d| d.id)
+                .unwrap_or(result.id),
+            memory: result.memory,
+            chunk: result.chunk,
+            similarity: result.similarity,
+            filepath: result.system.filepath,
+        }
+    }
+}
+
+fn profile_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    #[derive(Deserialize)]
+    struct Memory {
+        memory: String,
+    }
+    Ok(Option::<Vec<Memory>>::deserialize(deserializer)?
+        .map(|items| items.into_iter().map(|item| item.memory).collect()))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DeleteDocumentsResult {
+    pub count: u32,
+    pub errors: Vec<DeleteDocumentError>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DeleteDocumentError {
+    pub id: String,
+    pub error: String,
 }

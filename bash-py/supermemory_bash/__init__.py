@@ -41,13 +41,14 @@ __all__ = [
 @dataclass
 class CreateBashOptions:
     api_key: str
-    container_tag: str
+    container_tag: str | None = None
     base_url: str | None = None
     eager_load: bool = True
     eager_content: bool = True
     cwd: str = "/"
     env: dict[str, str] | None = None
     cache_ttl_ms: int | None = 150_000
+    namespace: str | None = None
 
 
 @dataclass
@@ -61,8 +62,9 @@ class CreateBashResult:
 
 async def create_bash(
     api_key: str,
-    container_tag: str,
+    container_tag: str | None = None,
     *,
+    namespace: str | None = None,
     base_url: str | None = None,
     eager_load: bool = True,
     eager_content: bool = True,
@@ -70,8 +72,13 @@ async def create_bash(
     env: dict[str, str] | None = None,
     cache_ttl_ms: int | None = 150_000,
 ) -> CreateBashResult:
+    if namespace and container_tag and namespace != container_tag:
+        raise ValueError("namespace and container_tag must identify the same namespace")
+    target = namespace if namespace is not None else container_tag
+    if not target:
+        raise ValueError("namespace is required")
     client = SupermemoryClient(api_key, base_url=base_url)
-    volume = SupermemoryVolume(client, container_tag, cache_ttl_ms=cache_ttl_ms)
+    volume = SupermemoryVolume(client, target, cache_ttl_ms=cache_ttl_ms)
 
     async def warm() -> None:
         await volume.list_by_prefix("/", with_content=eager_content)

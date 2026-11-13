@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any
 
 from ._client import SupermemoryClient
 from ._errors import ebusy, eexist, efbig, eio, enoent
 from ._path_index import PathIndex
-from ._session_cache import CachedEntry, DocStatus, SessionCache
+from ._session_cache import DocStatus, SessionCache
 from ._validation import ValidationCtx, assert_writable
 
 
@@ -83,7 +84,8 @@ def format_profile(resp: dict[str, Any]) -> str:
     static_items = profile.get("static") or []
     dynamic_items = profile.get("dynamic") or []
     if not static_items and not dynamic_items:
-        return f"{PROFILE_HEADER}\n(no memories extracted yet — write some files and check back in a few minutes)\n"
+        return (f"{PROFILE_HEADER}\n"
+                "(no memories extracted yet — write some files and check back in a few minutes)\n")
     parts: list[str] = [PROFILE_HEADER]
     if static_items:
         parts.append("\n## Core Knowledge\n")
@@ -125,14 +127,13 @@ class SupermemoryVolume:
         page = 1
         while True:
             params: dict[str, Any] = {
-                "containerTags": [self.container_tag],
                 "limit": 100,
                 "page": page,
                 "includeContent": include_content,
             }
             if filepath is not None:
                 params["filepath"] = filepath
-            resp = await self.client.documents_list(params)
+            resp = await self.client.documents_list(self.container_tag, params)
             for m in resp.get("memories", []):
                 yield m
             total_pages = resp.get("pagination", {}).get("totalPages", 1)
@@ -142,11 +143,10 @@ class SupermemoryVolume:
 
     async def _lookup_doc_id(self, path: str) -> str | None:
         cached = self.path_index.resolve(path)
-        if cached:
+        if isinstance(cached, str):
             return cached
         try:
-            resp = await self.client.documents_list({
-                "containerTags": [self.container_tag],
+            resp = await self.client.documents_list(self.container_tag, {
                 "limit": 1,
                 "page": 1,
                 "filepath": path,
@@ -177,17 +177,15 @@ class SupermemoryVolume:
         existing = self.path_index.resolve(path)
         try:
             if existing:
-                resp = await self.client.documents_update(existing, {
+                resp = await self.client.documents_update(self.container_tag, existing, {
                     "content": content,
-                    "containerTag": self.container_tag,
                     "filepath": path,
                 })
                 doc_id = resp.get("id", existing)
                 server_status = resp.get("status", "unknown")
             else:
-                resp = await self.client.documents_add({
+                resp = await self.client.documents_add(self.container_tag, {
                     "content": content,
-                    "containerTag": self.container_tag,
                     "filepath": path,
                 })
                 doc_id = resp["id"]
@@ -213,7 +211,7 @@ class SupermemoryVolume:
         if cached and isinstance(cached.content, str):
             return cached.content
         try:
-            resp = await self.client.profile({"containerTag": self.container_tag})
+            resp = await self.client.profile(self.container_tag)
         except Exception as err:
             raise eio(f"profile: {err}") from err
         body = format_profile(resp)
@@ -232,8 +230,7 @@ class SupermemoryVolume:
                 return DocResult(id=doc_id, content=cached.content, status=cached.status)
 
         try:
-            resp = await self.client.documents_list({
-                "containerTags": [self.container_tag],
+            resp = await self.client.documents_list(self.container_tag, {
                 "limit": 1,
                 "page": 1,
                 "includeContent": True,
@@ -277,7 +274,7 @@ class SupermemoryVolume:
             return
 
         try:
-            await self.client.documents_delete(doc_id)
+            await self.client.documents_delete(self.container_tag, doc_id)
         except Exception as err:
             status = getattr(err, "response", None)
             status_code = getattr(status, "status_code", None) if status else None
@@ -302,8 +299,7 @@ class SupermemoryVolume:
         failed_ids: set[str] = set()
         any_unattributed = False
         try:
-            resp = await self.client.documents_delete_bulk({
-                "containerTags": [self.container_tag],
+            resp = await self.client.documents_delete_bulk(self.container_tag, {
                 "filepath": filter_arg,
             })
             deleted = resp.get("deletedCount", 0)
@@ -348,7 +344,9 @@ class SupermemoryVolume:
         for i in range(0, len(matches), 100):
             batch = matches[i : i + 100]
             try:
-                resp = await self.client.documents_delete_bulk({"ids": [item[0] for item in batch]})
+                resp = await self.client.documents_delete_bulk(
+                    self.container_tag, {"ids": [item[0] for item in batch]}
+                )
                 deleted += resp.get("deletedCount", 0)
                 for e in resp.get("errors", []):
                     errors.append(Exception(f"{e.get('id')}: {e.get('error')}"))
@@ -378,8 +376,7 @@ class SupermemoryVolume:
             raise eexist(to_path)
 
         try:
-            await self.client.documents_update(doc_id, {
-                "containerTag": self.container_tag,
+            await self.client.documents_update(self.container_tag, doc_id, {
                 "filepath": to_path,
             })
         except Exception as err:
@@ -424,7 +421,7 @@ class SupermemoryVolume:
             mtime = 0.0
             if updated:
                 try:
-                    from datetime import datetime, timezone
+                    from datetime import datetime
                     mtime = datetime.fromisoformat(updated.replace("Z", "+00:00")).timestamp()
                 except Exception:
                     pass
@@ -501,15 +498,16 @@ class SupermemoryVolume:
         if cached:
             doc_id = self.path_index.resolve(path)
             if doc_id:
-                size = len(cached.content.encode() if isinstance(cached.content, str) else cached.content)
+                size = len(
+                    cached.content.encode() if isinstance(cached.content, str) else cached.content
+                )
                 return DocStat(
                     id=doc_id, is_file=True, is_directory=False,
                     size=size, mtime=0.0, status=cached.status,
                 )
 
         try:
-            resp = await self.client.documents_list({
-                "containerTags": [self.container_tag],
+            resp = await self.client.documents_list(self.container_tag, {
                 "limit": 1,
                 "page": 1,
                 "includeContent": True,
@@ -597,14 +595,13 @@ class SupermemoryVolume:
     async def search(self, q: str, filepath: str | None = None) -> SearchResp:
         try:
             body: dict[str, Any] = {
-                "q": q,
-                "containerTag": self.container_tag,
+                "query": q,
                 "searchMode": "hybrid",
                 "include": {"documents": True},
             }
             if filepath is not None:
                 body["filepath"] = filepath
-            resp = await self.client.search_memories(body)
+            resp = await self.client.search_memories(self.container_tag, body)
         except Exception as err:
             raise eio(f"search({q}): {err}") from err
 
@@ -642,7 +639,7 @@ class SupermemoryVolume:
         if self._last_configured_paths == key:
             return
         try:
-            await self.client.update_container_tag(
+            await self.client.update_namespace(
                 self.container_tag, {"memoryFilesystemPaths": paths}
             )
         except Exception as err:
