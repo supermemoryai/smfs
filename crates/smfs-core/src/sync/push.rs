@@ -459,7 +459,7 @@ fn stuck_tier(age_ms: i64) -> StuckTier {
     }
 }
 
-/// Poll tracked document states with at most eight concurrent v5 requests.
+// Apply terminal content before acknowledging its remote version.
 pub async fn run_inflight_poller(fs: Arc<SupermemoryFs>, mut shutdown: watch::Receiver<bool>) {
     if fs.api().is_none() {
         return;
@@ -544,15 +544,24 @@ pub async fn run_inflight_poller(fs: Arc<SupermemoryFs>, mut shutdown: watch::Re
                 // Disappeared from the processing list — terminal state.
                 // Fall back to a single GET to learn which terminal.
                 match api.get_document(&row.remote_id).await {
-                    Ok(doc) if doc.status == "done" => {
-                        let mirrored = crate::cache::parse_iso_to_ms(&doc.updated_at);
-                        db.set_mirrored_state(row.ino, mirrored, Some("done"), Some(now));
-                        tracing::debug!(
-                            ino = row.ino,
-                            remote_id = %row.remote_id,
-                            "push: status done"
-                        );
-                    }
+                    Ok(doc) if doc.status == "done" => match fs.reconcile_one(&doc) {
+                        Ok(outcome) => {
+                            tracing::debug!(
+                                ino = row.ino,
+                                remote_id = %row.remote_id,
+                                ?outcome,
+                                "push: terminal content reconciled"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                ino = row.ino,
+                                remote_id = %row.remote_id,
+                                error = %error,
+                                "push: terminal content reconciliation failed"
+                            );
+                        }
+                    },
                     Ok(doc) => {
                         db.set_mirrored_state(row.ino, None, Some(&doc.status), Some(now));
                     }

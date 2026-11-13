@@ -17,7 +17,5 @@ pub use db::{is_macos_noise_path, Db, DEFAULT_CHUNK_SIZE, DENTRY_CACHE_MAX, ROOT
 pub use fs::{ReconcileOutcome, SupermemoryFs};
 pub use hydration::{HydrationKey, HydrationScheduler};
 
-pub(crate) use fs::parse_iso_to_ms;
-
 #[cfg(test)]
 mod tests;
